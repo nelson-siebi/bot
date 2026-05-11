@@ -100,7 +100,7 @@ async function restructureWithAI(rawText: string, apiKey: string): Promise<{ tit
 }
 
 // ── HELP TEXT ─────────────────────────────────────────────────────────────────
-const HELP = `🤖 <b>Bot Admin — Gestion des infos</b>\n\n<b>📰 Articles</b>\n/list [n] — Derniers articles (défaut: 10, max: 20)\n/article &lt;id&gt; — Voir un article\n/delete &lt;id&gt; — Supprimer un article\n/deleteall — Supprimer TOUS les articles (DB seulement)\n/clearall — Supprimer TOUT (canal Telegram + DB + reset sources)\n/publish &lt;texte&gt; — Publier un article (texte)\n  ↳ Envoie une photo avec /publish en légende pour publier avec image\n\n<b>📡 Sources Telegram</b>\n/sources — Liste des sources actives\n/addsource &lt;@canal ou URL&gt; — Ajouter un canal Telegram\n/delsource &lt;id&gt; — Désactiver une source\n\n<b>⚙️ Système</b>\n/run — Lancer l'agrégation maintenant\n/stats — Statistiques de la plateforme\n/help — Afficher ce message`;
+const HELP = `🤖 <b>Bot Admin — Gestion des infos</b>\n\n<b>📰 Articles</b>\n/list [n] — Derniers articles (défaut: 10, max: 20)\n/article &lt;id&gt; — Voir un article\n/delete &lt;id&gt; — Supprimer un article\n/deleteall — Supprimer TOUS les articles (DB seulement)\n/clearall — Supprimer TOUT (canal Telegram + DB + reset sources)\n/clearall force — Supprimer les 100 derniers messages du canal (nucléaire)\n/publish &lt;texte&gt; — Publier un article (texte)\n  ↳ Envoie une photo avec /publish en légende pour publier avec image\n\n<b>📡 Sources Telegram</b>\n/sources — Liste des sources actives\n/addsource &lt;@canal ou URL&gt; — Ajouter un canal Telegram\n/delsource &lt;id&gt; — Désactiver une source\n\n<b>⚙️ Système</b>\n/run — Lancer l'agrégation maintenant\n/stats — Statistiques de la plateforme\n/help — Afficher ce message`;
 
 Deno.serve(async (req) => {
   if (req.method !== 'POST') {
@@ -221,10 +221,59 @@ Deno.serve(async (req) => {
 
     // ── /clearall ─────────────────────────────────────────────────────────
     else if (command === '/clearall') {
-      await reply(chatId, '⏳ Suppression en cours des messages du canal et de la base...');
+      const forceMode = args[0] === 'force';
+      await reply(chatId, forceMode 
+        ? '⏳ Nettoyage TOTAL (force) en cours... Cela peut prendre 2-3 minutes.' 
+        : '⏳ Suppression en cours des messages du canal et de la base...'
+      );
       
       try {
-        // 1. Get all articles with telegram_message_id
+        let deletedCount = 0;
+        let failedCount = 0;
+
+        // 1. FORCE MODE: Try to delete last 100 messages by message_id range
+        if (forceMode && OUTPUT_CHAT_ID) {
+          await reply(chatId, '🔥 Mode FORCE: tentative suppression des 100 derniers messages...');
+          
+          // Try to get the latest message first to know where to start
+          let startMsgId = 1000; // Default high number
+          try {
+            const latestRes = await fetch(`${BASE}/getUpdates?limit=1&offset=-1`);
+            const latestData = await latestRes.json();
+            if (latestData.ok && latestData.result?.length > 0) {
+              const lastUpdate = latestData.result[latestData.result.length - 1];
+              if (lastUpdate.channel_post?.chat?.id?.toString() === OUTPUT_CHAT_ID.replace('@', '')) {
+                startMsgId = lastUpdate.channel_post.message_id;
+              }
+            }
+          } catch (e) {
+            console.log('[Bot] Could not get latest update, using default range');
+          }
+
+          // Delete from startMsgId down to startMsgId-100
+          const endMsgId = Math.max(1, startMsgId - 100);
+          for (let msgId = startMsgId; msgId >= endMsgId; msgId--) {
+            const delRes = await fetch(`${BASE}/deleteMessage`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                chat_id: OUTPUT_CHAT_ID,
+                message_id: msgId,
+              }),
+            });
+            const delData = await delRes.json();
+            if (delData.ok) {
+              deletedCount++;
+            } else if (!delData.description?.includes('message to delete not found')) {
+              // Only count real errors, not "message not found"
+              failedCount++;
+            }
+            // Small delay to avoid rate limits
+            await new Promise(r => setTimeout(r, 50));
+          }
+        }
+
+        // 2. Get all articles with telegram_message_id (for tracked messages)
         const { data: articles, error: fetchError } = await supabase
           .from('articles')
           .select('id, telegram_message_id, telegram_chat_id, title')
@@ -236,10 +285,7 @@ Deno.serve(async (req) => {
           return new Response('OK', { status: 200 });
         }
 
-        let deletedCount = 0;
-        let failedCount = 0;
-        
-        // 2. Delete messages from Telegram channel
+        // 3. Delete tracked messages from Telegram channel
         if (articles && articles.length > 0) {
           for (const article of articles) {
             if (article.telegram_message_id && article.telegram_chat_id) {
@@ -264,7 +310,7 @@ Deno.serve(async (req) => {
           }
         }
 
-        // 3. Delete all articles from DB
+        // 4. Delete all articles from DB
         const { error: deleteError } = await supabase
           .from('articles')
           .delete()
@@ -275,7 +321,7 @@ Deno.serve(async (req) => {
           return new Response('OK', { status: 200 });
         }
 
-        // 4. Reset last_message_id in all telegram sources (first run mode)
+        // 5. Reset last_message_id in all telegram sources (first run mode)
         const { data: sources } = await supabase
           .from('sources')
           .select('id, config')
@@ -295,11 +341,12 @@ Deno.serve(async (req) => {
 
         await reply(chatId, 
           `✅ <b>Nettoyage complet terminé</b>\n\n` +
+          `${forceMode ? '🔥 Mode FORCE utilisé\n' : ''}` +
           `🗑 Messages Telegram supprimés: <b>${deletedCount}</b>\n` +
-          `❌ Échecs suppression: <b>${failedCount}</b>\n` +
+          `❌ Échecs: <b>${failedCount}</b>\n` +
           `🗑 Articles DB supprimés: <b>${articles?.length || 0}</b>\n` +
-          `🔄 Sources reset (first-run mode): <b>${resetCount}</b>\n\n` +
-          `Prochain /run ne récupérera que les 5 derniers messages.`
+          `🔄 Sources reset: <b>${resetCount}</b>\n\n` +
+          `💡 Astuce: Utilise <code>/clearall force</code> pour supprimer les 100 derniers messages du canal (même sans tracking).`
         );
       } catch (err) {
         console.error('[Bot] /clearall error:', err);
