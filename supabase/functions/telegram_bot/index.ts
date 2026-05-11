@@ -379,6 +379,9 @@ Deno.serve(async (req) => {
           return new Response('OK', { status: 200 });
         }
 
+        const uniqueSuffix = new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 14);
+        const uniqueTitle = `${finalTitle} #${uniqueSuffix}`;
+
         // Automatically append @izynews at the very bottom
         const footer = "\n\n@izynews";
         if (finalContent && !finalContent.includes('@izynews')) {
@@ -399,7 +402,7 @@ Deno.serve(async (req) => {
 
         // Insert into database
         const { data: inserted, error } = await supabase.from('articles').insert({
-          title: finalTitle,
+          title: uniqueTitle,
           summary: finalContent.substring(0, 500),
           content: finalContent,
           original_url: `https://t.me/admin_publish_${Date.now()}`,
