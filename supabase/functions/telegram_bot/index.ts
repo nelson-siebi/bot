@@ -496,7 +496,26 @@ Deno.serve(async (req) => {
         method: 'POST',
         headers: { Authorization: `Bearer ${serviceKey}` },
       });
-      const result = await res.json();
+      const raw = await res.text();
+      let result: any = null;
+      try {
+        result = raw ? JSON.parse(raw) : null;
+      } catch (_e) {
+        result = null;
+      }
+
+      if (!res.ok) {
+        console.error('[Bot] /run aggregate_news HTTP error:', res.status, raw?.slice(0, 500));
+        await reply(chatId, `❌ Erreur d'agrégation (HTTP ${res.status}). Vérifie les logs Supabase.`);
+        return new Response('OK', { status: 200 });
+      }
+
+      if (!result) {
+        console.error('[Bot] /run aggregate_news invalid JSON:', raw?.slice(0, 500));
+        await reply(chatId, `❌ Erreur d'agrégation: réponse invalide (non-JSON). Vérifie les logs Supabase.`);
+        return new Response('OK', { status: 200 });
+      }
+
       if (result.success) {
         await reply(chatId,
           `✅ Agrégation terminée!\n📊 Traités: <b>${result.processed}</b>\n🆕 Nouveaux: <b>${result.new}</b>`
