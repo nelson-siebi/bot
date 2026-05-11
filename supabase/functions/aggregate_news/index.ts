@@ -19,10 +19,21 @@ const AD_PATTERNS = [
   /invest|trading|crypto|bitcoin|forex/i,
   /gagn\w+\s+de\s+l.argent/i,
   /sponsor|partenariat\s+commercial/i,
+  /annonce|à\s+vendre|en\s+vente|prix\s*:|contactez\s*:|whatsap/i,
+  /cherche\s+.*\s+(emploi|travail|job)/i,
+  /recrute|recrutement|urgent|limité/i,
+  /offre\s+spéciale|exceptionnel|dernière\s+chance/i,
 ];
 function isQuickAd(text: string): boolean {
+  const lower = text.toLowerCase();
   let hits = 0;
-  for (const p of AD_PATTERNS) if (p.test(text)) hits++;
+  for (const p of AD_PATTERNS) if (p.test(lower)) hits++;
+  // Also check for excessive caps or numbers (typical of ads)
+  const capsRatio = (text.match(/[A-Z]/g) || []).length / text.length;
+  if (capsRatio > 0.5 && text.length > 20) hits++;
+  // Check for excessive emoji (ads often have many)
+  const emojiCount = (text.match(/[\u{1F300}-\u{1F9FF}]/gu) || []).length;
+  if (emojiCount > 8) hits++;
   return hits >= 2;
 }
 
@@ -141,12 +152,13 @@ async function restructureWithAI(rawText: string): Promise<{ title: string; cont
 }
 
 // ── Send to output Telegram channel ─────────────────────────────────────
-async function sendToTelegram(text: string, photoUrl?: string) {
-  if (!OUTPUT_CHAT_ID || !BOT_TOKEN) return;
+// Returns the telegram message_id if successful
+async function sendToTelegram(text: string, photoUrl?: string): Promise<number | null> {
+  if (!OUTPUT_CHAT_ID || !BOT_TOKEN) return null;
   try {
+    let res;
     if (photoUrl) {
-      // sendPhoto accepts direct URL
-      const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto`, {
+      res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -156,23 +168,29 @@ async function sendToTelegram(text: string, photoUrl?: string) {
           parse_mode: 'HTML',
         }),
       });
-      const data = await res.json();
-      if (!data.ok) {
-        // If photo URL fails, fall back to text-only
-        console.warn('[Telegram] sendPhoto failed, falling back to text:', data.description);
-        await sendToTelegram(text);
-      }
     } else {
-      const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+      res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ chat_id: OUTPUT_CHAT_ID, text: text.substring(0, 4096), parse_mode: 'HTML' }),
       });
-      if (!res.ok) console.error('[Telegram] sendMessage failed:', await res.text());
+    }
+    const data = await res.json();
+    if (data.ok && data.result?.message_id) {
+      return data.result.message_id;
+    }
+    if (!data.ok && photoUrl) {
+      console.warn('[Telegram] sendPhoto failed, falling back to text:', data.description);
+      // Fallback to text-only
+      return await sendToTelegram(text);
+    }
+    if (!data.ok) {
+      console.error('[Telegram] send failed:', data.description || await res.text());
     }
   } catch (e) {
     console.error('[Telegram] send error:', e);
   }
+  return null;
 }
 
 // ── Main handler ──────────────────────────────────────────────────────────
@@ -207,9 +225,16 @@ Deno.serve(async (req) => {
       const messages = await scrapeChannel(channel, lastMsgId);
       console.log(`[Aggregate] Found ${messages.length} new message(s) in @${channel}`);
 
+      // FIRST RUN: limit to last 5 messages only to avoid spam
+      let messagesToProcess = messages;
+      if (lastMsgId === 0 && messages.length > 5) {
+        messagesToProcess = messages.slice(-5); // Take only last 5
+        console.log(`[Aggregate] First run - limiting to last 5 messages only`);
+      }
+
       let maxMsgId = lastMsgId;
 
-      for (const msg of messages) {
+      for (const msg of messagesToProcess) {
         processedCount++;
         maxMsgId = Math.max(maxMsgId, msg.id);
 
@@ -247,7 +272,14 @@ Deno.serve(async (req) => {
 
         const textWithCredit = `${finalContent}\n\n📢 @izynews`;
 
-        // ── Save to DB
+        // ── Publish to Telegram channel FIRST (to get message_id)
+        const telegramMsgId = await sendToTelegram(textWithCredit, msg.photoUrl);
+        if (!telegramMsgId) {
+          console.warn(`[Aggregate] Failed to publish msg ${msg.id} to Telegram, skipping DB insert`);
+          continue;
+        }
+
+        // ── Save to DB with telegram_message_id
         const { error: insertError } = await supabase
           .from('articles')
           .insert({
@@ -257,17 +289,27 @@ Deno.serve(async (req) => {
             original_url: originalUrl,
             source_id: source.id,
             is_certified: false,
+            telegram_message_id: telegramMsgId,
+            telegram_chat_id: OUTPUT_CHAT_ID,
           });
 
         if (insertError) {
           console.error('[Aggregate] DB insert error:', insertError);
+          // Try to delete the telegram message if DB insert failed
+          try {
+            await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ chat_id: OUTPUT_CHAT_ID, message_id: telegramMsgId }),
+            });
+          } catch (e) {
+            console.error('[Aggregate] Failed to cleanup telegram message:', e);
+          }
           continue;
         }
 
-        // ── Publish to Telegram channel
-        await sendToTelegram(textWithCredit, msg.photoUrl);
         newArticlesCount++;
-        console.log(`[Aggregate] Published msg ${msg.id} from @${channel}`);
+        console.log(`[Aggregate] Published msg ${msg.id} from @${channel} (TG msg_id: ${telegramMsgId})`);
 
         // Small delay to avoid rate limits
         await new Promise(r => setTimeout(r, 1500));

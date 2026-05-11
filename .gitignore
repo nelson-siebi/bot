@@ -1,0 +1,30 @@
+# Secrets and environment variables
+.env
+.env.local
+.env.*.local
+
+# Dependencies
+node_modules/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Supabase
+supabase/.temp/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Agents and tools
+.agents/
+.aider-desk/
+.codestudio/
+.commandcode/
+.continue/
+
+# Logs
+*.log

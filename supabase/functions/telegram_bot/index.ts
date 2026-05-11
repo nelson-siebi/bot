@@ -100,7 +100,7 @@ async function restructureWithAI(rawText: string, apiKey: string): Promise<{ tit
 }
 
 // ── HELP TEXT ─────────────────────────────────────────────────────────────────
-const HELP = `🤖 <b>Bot Admin — Gestion des infos</b>\n\n<b>📰 Articles</b>\n/list [n] — Derniers articles (défaut: 10, max: 20)\n/article &lt;id&gt; — Voir un article\n/delete &lt;id&gt; — Supprimer un article\n/deleteall — Supprimer TOUS les articles\n/publish &lt;texte&gt; — Publier un article (texte)\n  ↳ Envoie une photo avec /publish en légende pour publier avec image\n\n<b>📡 Sources Telegram</b>\n/sources — Liste des sources actives\n/addsource &lt;@canal ou URL&gt; — Ajouter un canal Telegram\n/delsource &lt;id&gt; — Désactiver une source\n\n<b>⚙️ Système</b>\n/run — Lancer l'agrégation maintenant\n/stats — Statistiques de la plateforme\n/help — Afficher ce message`;
+const HELP = `🤖 <b>Bot Admin — Gestion des infos</b>\n\n<b>📰 Articles</b>\n/list [n] — Derniers articles (défaut: 10, max: 20)\n/article &lt;id&gt; — Voir un article\n/delete &lt;id&gt; — Supprimer un article\n/deleteall — Supprimer TOUS les articles (DB seulement)\n/clearall — Supprimer TOUT (canal Telegram + DB + reset sources)\n/publish &lt;texte&gt; — Publier un article (texte)\n  ↳ Envoie une photo avec /publish en légende pour publier avec image\n\n<b>📡 Sources Telegram</b>\n/sources — Liste des sources actives\n/addsource &lt;@canal ou URL&gt; — Ajouter un canal Telegram\n/delsource &lt;id&gt; — Désactiver une source\n\n<b>⚙️ Système</b>\n/run — Lancer l'agrégation maintenant\n/stats — Statistiques de la plateforme\n/help — Afficher ce message`;
 
 Deno.serve(async (req) => {
   if (req.method !== 'POST') {
@@ -217,6 +217,94 @@ Deno.serve(async (req) => {
       const { error } = await supabase.from('articles').delete().neq('id', '00000000-0000-0000-0000-000000000000');
       if (error) { await reply(chatId, `❌ Erreur lors de la suppression: ${error.message}`); }
       else { await reply(chatId, `✅ TOUS les articles ont été supprimés de la base de données.`); }
+    }
+
+    // ── /clearall ─────────────────────────────────────────────────────────
+    else if (command === '/clearall') {
+      await reply(chatId, '⏳ Suppression en cours des messages du canal et de la base...');
+      
+      try {
+        // 1. Get all articles with telegram_message_id
+        const { data: articles, error: fetchError } = await supabase
+          .from('articles')
+          .select('id, telegram_message_id, telegram_chat_id, title')
+          .not('telegram_message_id', 'is', null)
+          .order('created_at', { ascending: false });
+        
+        if (fetchError) {
+          await reply(chatId, `❌ Erreur récupération articles: ${fetchError.message}`);
+          return new Response('OK', { status: 200 });
+        }
+
+        let deletedCount = 0;
+        let failedCount = 0;
+        
+        // 2. Delete messages from Telegram channel
+        if (articles && articles.length > 0) {
+          for (const article of articles) {
+            if (article.telegram_message_id && article.telegram_chat_id) {
+              const delRes = await fetch(`${BASE}/deleteMessage`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  chat_id: article.telegram_chat_id,
+                  message_id: article.telegram_message_id,
+                }),
+              });
+              const delData = await delRes.json();
+              if (delData.ok) {
+                deletedCount++;
+              } else {
+                failedCount++;
+                console.warn(`[Bot] Failed to delete message ${article.telegram_message_id}:`, delData.description);
+              }
+              // Small delay to avoid rate limits
+              await new Promise(r => setTimeout(r, 100));
+            }
+          }
+        }
+
+        // 3. Delete all articles from DB
+        const { error: deleteError } = await supabase
+          .from('articles')
+          .delete()
+          .neq('id', '00000000-0000-0000-0000-000000000000');
+        
+        if (deleteError) {
+          await reply(chatId, `❌ Erreur suppression DB: ${deleteError.message}`);
+          return new Response('OK', { status: 200 });
+        }
+
+        // 4. Reset last_message_id in all telegram sources (first run mode)
+        const { data: sources } = await supabase
+          .from('sources')
+          .select('id, config')
+          .eq('type', 'telegram');
+        
+        let resetCount = 0;
+        if (sources) {
+          for (const source of sources) {
+            const newConfig = { ...source.config, last_message_id: '0' };
+            const { error: updateError } = await supabase
+              .from('sources')
+              .update({ config: newConfig })
+              .eq('id', source.id);
+            if (!updateError) resetCount++;
+          }
+        }
+
+        await reply(chatId, 
+          `✅ <b>Nettoyage complet terminé</b>\n\n` +
+          `🗑 Messages Telegram supprimés: <b>${deletedCount}</b>\n` +
+          `❌ Échecs suppression: <b>${failedCount}</b>\n` +
+          `🗑 Articles DB supprimés: <b>${articles?.length || 0}</b>\n` +
+          `🔄 Sources reset (first-run mode): <b>${resetCount}</b>\n\n` +
+          `Prochain /run ne récupérera que les 5 derniers messages.`
+        );
+      } catch (err) {
+        console.error('[Bot] /clearall error:', err);
+        await reply(chatId, `💥 Erreur lors du nettoyage: ${(err as Error).message}`);
+      }
     }
 
     // ── /publish ──────────────────────────────────────────────────────────
