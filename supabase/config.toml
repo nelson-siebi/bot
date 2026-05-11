@@ -428,3 +428,9 @@ entrypoint = "./functions/clear_db/index.ts"
 # Specifies static files to be bundled with the function. Supports glob patterns.
 # For example, if you want to serve static HTML pages in your function:
 # static_files = [ "./functions/clear_db/*.html" ]
+
+[functions.telegram_bot]
+enabled = true
+verify_jwt = false
+import_map = "./functions/telegram_bot/deno.json"
+entrypoint = "./functions/telegram_bot/index.ts"
