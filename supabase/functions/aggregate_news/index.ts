@@ -1,15 +1,30 @@
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
+import { S3Client, PutObjectCommand, GetObjectCommand } from 'https://esm.sh/@aws-sdk/client-s3@3.758.0?target=deno'
+import { getSignedUrl } from 'https://esm.sh/@aws-sdk/s3-request-presigner@3.758.0?target=deno'
 
 const BOT_TOKEN = Deno.env.get('TELEGRAM_BOT_TOKEN') || '';
 const OUTPUT_CHAT_ID = Deno.env.get('TELEGRAM_CHAT_ID') || '';
 const GEMINI_API_KEY = Deno.env.get('GEMINI_API_KEY') || '';
 
 // Storj S3-compatible configuration
-const STORJ_ACCESS_KEY = Deno.env.get('STORJ_ACCESS_KEY') || 'jvkub5kqheygssr4turai73v5zpq';
-const STORJ_SECRET_KEY = Deno.env.get('STORJ_SECRET_KEY') || 'j2vsxcv5amzvilfsrsvy2mlqeesoflp32pqfan44mybtojmxcdqkc';
+const STORJ_ACCESS_KEY = Deno.env.get('STORJ_ACCESS_KEY') || '';
+const STORJ_SECRET_KEY = Deno.env.get('STORJ_SECRET_KEY') || '';
 const STORJ_ENDPOINT = Deno.env.get('STORJ_ENDPOINT') || 'https://gateway.storjshare.io';
-const STORJ_BUCKET = Deno.env.get('STORJ_BUCKET') || 'izynews-media';
+const STORJ_BUCKET = Deno.env.get('STORJ_BUCKET') || '';
 const STORJ_REGION = 'us-east-1'; // Storj uses this region by default
+
+function getStorjS3Client(): S3Client | null {
+  if (!STORJ_ACCESS_KEY || !STORJ_SECRET_KEY || !STORJ_BUCKET) return null;
+  return new S3Client({
+    region: STORJ_REGION,
+    endpoint: STORJ_ENDPOINT,
+    forcePathStyle: true,
+    credentials: {
+      accessKeyId: STORJ_ACCESS_KEY,
+      secretAccessKey: STORJ_SECRET_KEY,
+    },
+  });
+}
 
 interface ScrapedMessage {
   id: number;
@@ -269,49 +284,36 @@ async function restructureWithAI(rawText: string): Promise<{ title: string; cont
   return { title: '', content: rawText, isAd: false };
 }
 
-// ── Upload to Storj ────────────────────────────────────────────────────
-async function uploadToStorj(buffer: Uint8Array, filename: string, contentType: string): Promise<string | null> {
+// ── Upload to Storj (S3) + return SIGNED URL for Telegram ───────────────
+async function uploadToStorjAndGetSignedUrl(
+  buffer: Uint8Array,
+  filename: string,
+  contentType: string,
+): Promise<string | null> {
+  const s3 = getStorjS3Client();
+  if (!s3) return null;
+
   try {
-    // Generate unique filename with timestamp
-    const timestamp = Date.now();
-    const extension = filename.split('.').pop() || 'jpg';
-    const uniqueFilename = `${timestamp}_${filename}`;
-    
-    // Create presigned URL for upload
-    const uploadUrl = `${STORJ_ENDPOINT}/${STORJ_BUCKET}/${uniqueFilename}`;
-    
-    // Upload directly to Storj
-    const uploadRes = await fetch(uploadUrl, {
-      method: 'PUT',
-      headers: {
-        'Content-Type': contentType,
-        'Content-Length': buffer.length.toString(),
-        'Authorization': `AWS4-HMAC-SHA256 Credential=${STORJ_ACCESS_KEY}/${new Date().toISOString().slice(0, 10)}/${STORJ_REGION}/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=${await generateSignature('PUT', uniqueFilename, contentType, buffer.length)}`,
-        'x-amz-date': new Date().toISOString().replace(/[:\-]T/, '').replace(/\.[\d:]+/, ''),
-        'host': new URL(STORJ_ENDPOINT).hostname
-      },
-      body: buffer
-    });
-    
-    if (!uploadRes.ok) {
-      console.error(`[Storj] Upload failed: ${uploadRes.status}`);
-      return null;
-    }
-    
-    // Return public URL
-    const publicUrl = `${STORJ_ENDPOINT}/${STORJ_BUCKET}/${uniqueFilename}`;
+    const uniqueFilename = `${Date.now()}_${Math.random().toString(36).slice(2)}_${filename}`;
+    await s3.send(new PutObjectCommand({
+      Bucket: STORJ_BUCKET,
+      Key: uniqueFilename,
+      Body: buffer,
+      ContentType: contentType,
+    }));
+
+    const signedUrl = await getSignedUrl(
+      s3,
+      new GetObjectCommand({ Bucket: STORJ_BUCKET, Key: uniqueFilename }),
+      { expiresIn: 60 * 60 },
+    );
+
     console.log(`[Storj] Uploaded: ${uniqueFilename} (${(buffer.length / 1024 / 1024).toFixed(2)} MB)`);
-    return publicUrl;
+    return signedUrl;
   } catch (e) {
-    console.error('[Storj] Upload error:', e);
+    console.error('[Storj] Upload/sign error:', e);
     return null;
   }
-}
-
-// Simple signature generation for Storj (S3-compatible)
-async function generateSignature(method: string, filename: string, contentType: string, contentLength: number): Promise<string> {
-  // For simplicity, using basic auth (Storj supports this for public buckets)
-  return 'temp';
 }
 
 // ── Download media from URL ──────────────────────────────────────────────
@@ -396,8 +398,8 @@ async function sendPhotoToTelegram(text: string, photoUrl: string): Promise<numb
       return sendTextToTelegram(text);
     }
     
-    // Upload to Storj for permanent storage
-    const storjUrl = await uploadToStorj(mediaData, 'photo.jpg', 'image/jpeg');
+    // Upload to Storj (S3) and get a signed GET URL for Telegram
+    const storjUrl = await uploadToStorjAndGetSignedUrl(mediaData, 'photo.jpg', 'image/jpeg');
     
     if (!storjUrl) {
       console.warn('[Telegram] Failed to upload to Storj, using direct upload');
@@ -542,8 +544,8 @@ async function sendVideoToTelegram(text: string, videoUrl: string): Promise<numb
     
     console.log(`[Telegram] Video downloaded: ${(mediaData.length / 1024 / 1024).toFixed(2)} MB`);
     
-    // Upload to Storj for permanent storage
-    const storjUrl = await uploadToStorj(mediaData, 'video.mp4', 'video/mp4');
+    // Upload to Storj (S3) and get a signed GET URL for Telegram
+    const storjUrl = await uploadToStorjAndGetSignedUrl(mediaData, 'video.mp4', 'video/mp4');
     
     if (!storjUrl) {
       console.warn('[Telegram] Failed to upload to Storj, using direct upload');
