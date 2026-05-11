@@ -19,21 +19,44 @@ const AD_PATTERNS = [
   /invest|trading|crypto|bitcoin|forex/i,
   /gagn\w+\s+de\s+l.argent/i,
   /sponsor|partenariat\s+commercial/i,
-  /annonce|à\s+vendre|en\s+vente|prix\s*:|contactez\s*:|whatsap/i,
-  /cherche\s+.*\s+(emploi|travail|job)/i,
-  /recrute|recrutement|urgent|limité/i,
-  /offre\s+spéciale|exceptionnel|dernière\s+chance/i,
+  /annonce|à\s+vendre|en\s+vente|prix\s*[:\-]|[📞📱]\s*contact|whatsap/i,
+  /cherche\s+.*\s+(emploi|travail|job)|offre\s+d'?emploi/i,
+  /recrute|recrutement|urgent|limité|disponible\s+maintenant/i,
+  /offre\s+spéciale|exceptionnel|dernière\s+chance|promotion/i,
+  /faire\s+de\s+l'argent|gagner\s+(de\s+l')?argent|revenu\s+passif/i,
+  /inscription\s+gratuite|inscrivez[-\s]vous/i,
+  /💰|💵|💲|🏷️|🛒|🛍️|📢/,
+];
+const AD_KEYWORDS_STRICT = [
+  'annonce', 'à vendre', 'en vente', 'prix:', 'prix :', 'contactez', 
+  'recrutement', 'offre d\'emploi', ' Opportunité', 'gagner de l\'argent'
 ];
 function isQuickAd(text: string): boolean {
   const lower = text.toLowerCase();
   let hits = 0;
   for (const p of AD_PATTERNS) if (p.test(lower)) hits++;
-  // Also check for excessive caps or numbers (typical of ads)
+  
+  // Strict keyword check (immediate detection)
+  for (const keyword of AD_KEYWORDS_STRICT) {
+    if (lower.includes(keyword.toLowerCase())) {
+      console.log(`[Filter] Strict keyword detected: "${keyword}"`);
+      return true;
+    }
+  }
+  
+  // Check for excessive caps (typical of ads)
   const capsRatio = (text.match(/[A-Z]/g) || []).length / text.length;
-  if (capsRatio > 0.5 && text.length > 20) hits++;
+  if (capsRatio > 0.6 && text.length > 15) hits += 2;
+  
   // Check for excessive emoji (ads often have many)
   const emojiCount = (text.match(/[\u{1F300}-\u{1F9FF}]/gu) || []).length;
-  if (emojiCount > 8) hits++;
+  if (emojiCount > 6) hits++;
+  if (emojiCount > 10) hits += 2;
+  
+  // Check for excessive numbers (prices, phone numbers)
+  const digitCount = (text.match(/\d/g) || []).length;
+  if (digitCount > 15) hits++;
+  
   return hits >= 2;
 }
 
@@ -253,9 +276,11 @@ Deno.serve(async (req) => {
           continue;
         }
 
-        // ── Quick ad pre-filter
+        // ── Quick ad pre-filter (STRICT MODE)
         if (isQuickAd(msg.text)) {
-          console.log(`[Aggregate] Quick ad filter blocked msg ${msg.id}`);
+          console.log(`[Aggregate] 🚫 AD BLOCKED: msg ${msg.id} from @${channel}`);
+          // Mark as processed to avoid re-processing
+          maxMsgId = Math.max(maxMsgId, msg.id);
           continue;
         }
 
