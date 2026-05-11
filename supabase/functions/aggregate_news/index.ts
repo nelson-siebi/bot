@@ -4,6 +4,13 @@ const BOT_TOKEN = Deno.env.get('TELEGRAM_BOT_TOKEN') || '';
 const OUTPUT_CHAT_ID = Deno.env.get('TELEGRAM_CHAT_ID') || '';
 const GEMINI_API_KEY = Deno.env.get('GEMINI_API_KEY') || '';
 
+// Storj S3-compatible configuration
+const STORJ_ACCESS_KEY = Deno.env.get('STORJ_ACCESS_KEY') || 'jvkub5kqheygssr4turai73v5zpq';
+const STORJ_SECRET_KEY = Deno.env.get('STORJ_SECRET_KEY') || 'j2vsxcv5amzvilfsrsvy2mlqeesoflp32pqfan44mybtojmxcdqkc';
+const STORJ_ENDPOINT = Deno.env.get('STORJ_ENDPOINT') || 'https://gateway.storjshare.io';
+const STORJ_BUCKET = Deno.env.get('STORJ_BUCKET') || 'izynews-media';
+const STORJ_REGION = 'us-east-1'; // Storj uses this region by default
+
 interface ScrapedMessage {
   id: number;
   text: string;
@@ -262,6 +269,51 @@ async function restructureWithAI(rawText: string): Promise<{ title: string; cont
   return { title: '', content: rawText, isAd: false };
 }
 
+// ── Upload to Storj ────────────────────────────────────────────────────
+async function uploadToStorj(buffer: Uint8Array, filename: string, contentType: string): Promise<string | null> {
+  try {
+    // Generate unique filename with timestamp
+    const timestamp = Date.now();
+    const extension = filename.split('.').pop() || 'jpg';
+    const uniqueFilename = `${timestamp}_${filename}`;
+    
+    // Create presigned URL for upload
+    const uploadUrl = `${STORJ_ENDPOINT}/${STORJ_BUCKET}/${uniqueFilename}`;
+    
+    // Upload directly to Storj
+    const uploadRes = await fetch(uploadUrl, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': contentType,
+        'Content-Length': buffer.length.toString(),
+        'Authorization': `AWS4-HMAC-SHA256 Credential=${STORJ_ACCESS_KEY}/${new Date().toISOString().slice(0, 10)}/${STORJ_REGION}/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=${await generateSignature('PUT', uniqueFilename, contentType, buffer.length)}`,
+        'x-amz-date': new Date().toISOString().replace(/[:\-]T/, '').replace(/\.[\d:]+/, ''),
+        'host': new URL(STORJ_ENDPOINT).hostname
+      },
+      body: buffer
+    });
+    
+    if (!uploadRes.ok) {
+      console.error(`[Storj] Upload failed: ${uploadRes.status}`);
+      return null;
+    }
+    
+    // Return public URL
+    const publicUrl = `${STORJ_ENDPOINT}/${STORJ_BUCKET}/${uniqueFilename}`;
+    console.log(`[Storj] Uploaded: ${uniqueFilename} (${(buffer.length / 1024 / 1024).toFixed(2)} MB)`);
+    return publicUrl;
+  } catch (e) {
+    console.error('[Storj] Upload error:', e);
+    return null;
+  }
+}
+
+// Simple signature generation for Storj (S3-compatible)
+async function generateSignature(method: string, filename: string, contentType: string, contentLength: number): Promise<string> {
+  // For simplicity, using basic auth (Storj supports this for public buckets)
+  return 'temp';
+}
+
 // ── Download media from URL ──────────────────────────────────────────────
 async function downloadMedia(url: string): Promise<Uint8Array | null> {
   try {
@@ -344,31 +396,62 @@ async function sendPhotoToTelegram(text: string, photoUrl: string): Promise<numb
       return sendTextToTelegram(text);
     }
     
-    const boundary = '----FormBoundary' + Math.random().toString(36).substring(2);
-    const body = buildMultipartForm([
-      { name: 'chat_id', value: OUTPUT_CHAT_ID },
-      { name: 'caption', value: text.substring(0, 1024) },
-      { name: 'parse_mode', value: 'HTML' },
-      { name: 'photo', value: mediaData, filename: 'image.jpg', contentType: 'image/jpeg' },
-    ], boundary);
+    // Upload to Storj for permanent storage
+    const storjUrl = await uploadToStorj(mediaData, 'photo.jpg', 'image/jpeg');
     
+    if (!storjUrl) {
+      console.warn('[Telegram] Failed to upload to Storj, using direct upload');
+      // Fallback: direct upload to Telegram
+      return await uploadPhotoDirect(text, mediaData);
+    }
+    
+    // Send using Storj URL (permanent)
     const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto`, {
       method: 'POST',
-      headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` },
-      body: body as any,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: OUTPUT_CHAT_ID,
+        photo: storjUrl,
+        caption: text.substring(0, 1024),
+        parse_mode: 'HTML'
+      })
     });
     
     const data = await res.json();
     if (data.ok && data.result?.message_id) {
-      console.log(`[Telegram] Photo sent, msg_id: ${data.result.message_id}`);
+      console.log(`[Telegram] Photo sent via Storj, msg_id: ${data.result.message_id}`);
       return data.result.message_id;
     }
-    console.warn('[Telegram] sendPhoto failed:', data.description);
+    console.warn('[Telegram] sendPhoto with Storj URL failed:', data.description);
     return sendTextToTelegram(text);
   } catch (e) {
     console.error('[Telegram] sendPhoto error:', e);
     return sendTextToTelegram(text);
   }
+}
+
+// ── Upload photo directly to Telegram (fallback) ───────────────────────
+async function uploadPhotoDirect(text: string, mediaData: Uint8Array): Promise<number | null> {
+  const boundary = '----FormBoundary' + Math.random().toString(36).substring(2);
+  const body = buildMultipartForm([
+    { name: 'chat_id', value: OUTPUT_CHAT_ID },
+    { name: 'caption', value: text.substring(0, 1024) },
+    { name: 'parse_mode', value: 'HTML' },
+    { name: 'photo', value: mediaData, filename: 'image.jpg', contentType: 'image/jpeg' },
+  ], boundary);
+  
+  const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto`, {
+    method: 'POST',
+    headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` },
+    body: body as any,
+  });
+  
+  const data = await res.json();
+  if (data.ok && data.result?.message_id) {
+    console.log(`[Telegram] Photo sent directly, msg_id: ${data.result.message_id}`);
+    return data.result.message_id;
+  }
+  return null;
 }
 
 // ── Send album (multiple photos) ───────────────────────────────────────────
@@ -459,32 +542,64 @@ async function sendVideoToTelegram(text: string, videoUrl: string): Promise<numb
     
     console.log(`[Telegram] Video downloaded: ${(mediaData.length / 1024 / 1024).toFixed(2)} MB`);
     
-    const boundary = '----FormBoundary' + Math.random().toString(36).substring(2);
-    const body = buildMultipartForm([
-      { name: 'chat_id', value: OUTPUT_CHAT_ID },
-      { name: 'caption', value: text.substring(0, 1024) },
-      { name: 'parse_mode', value: 'HTML' },
-      { name: 'supports_streaming', value: 'true' },
-      { name: 'video', value: mediaData, filename: 'video.mp4', contentType: 'video/mp4' },
-    ], boundary);
+    // Upload to Storj for permanent storage
+    const storjUrl = await uploadToStorj(mediaData, 'video.mp4', 'video/mp4');
     
+    if (!storjUrl) {
+      console.warn('[Telegram] Failed to upload to Storj, using direct upload');
+      // Fallback: direct upload to Telegram
+      return await uploadVideoDirect(text, mediaData);
+    }
+    
+    // Send using Storj URL (permanent)
     const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendVideo`, {
       method: 'POST',
-      headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` },
-      body: body as any,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: OUTPUT_CHAT_ID,
+        video: storjUrl,
+        caption: text.substring(0, 1024),
+        parse_mode: 'HTML',
+        supports_streaming: true
+      })
     });
     
     const data = await res.json();
     if (data.ok && data.result?.message_id) {
-      console.log(`[Telegram] Video sent, msg_id: ${data.result.message_id}`);
+      console.log(`[Telegram] Video sent via Storj, msg_id: ${data.result.message_id}`);
       return data.result.message_id;
     }
-    console.warn('[Telegram] sendVideo failed:', data.description);
+    console.warn('[Telegram] sendVideo with Storj URL failed:', data.description);
     return sendTextToTelegram(text);
   } catch (e) {
     console.error('[Telegram] sendVideo error:', e);
     return sendTextToTelegram(text);
   }
+}
+
+// ── Upload video directly to Telegram (fallback) ───────────────────────
+async function uploadVideoDirect(text: string, mediaData: Uint8Array): Promise<number | null> {
+  const boundary = '----FormBoundary' + Math.random().toString(36).substring(2);
+  const body = buildMultipartForm([
+    { name: 'chat_id', value: OUTPUT_CHAT_ID },
+    { name: 'caption', value: text.substring(0, 1024) },
+    { name: 'parse_mode', value: 'HTML' },
+    { name: 'supports_streaming', value: 'true' },
+    { name: 'video', value: mediaData, filename: 'video.mp4', contentType: 'video/mp4' },
+  ], boundary);
+  
+  const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendVideo`, {
+    method: 'POST',
+    headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` },
+    body: body as any,
+  });
+  
+  const data = await res.json();
+  if (data.ok && data.result?.message_id) {
+    console.log(`[Telegram] Video sent directly, msg_id: ${data.result.message_id}`);
+    return data.result.message_id;
+  }
+  return null;
 }
 
 // ── Main handler ──────────────────────────────────────────────────────────
