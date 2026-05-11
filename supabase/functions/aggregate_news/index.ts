@@ -7,7 +7,10 @@ const GEMINI_API_KEY = Deno.env.get('GEMINI_API_KEY') || '';
 interface ScrapedMessage {
   id: number;
   text: string;
-  photoUrl?: string;
+  photoUrls?: string[];  // All photos in album
+  videoUrl?: string;     // Video if present
+  videoDuration?: number; // Duration in seconds (if available)
+  hasMedia: boolean;
 }
 
 // ── Quick keyword-based ad pre-filter ──────────────────────────────────────
@@ -71,6 +74,56 @@ function extractPhotoUrlFromBlock(block: string): string | undefined {
   return undefined;
 }
 
+// Extract ALL photos from an album message
+function extractAllPhotosFromBlock(block: string): string[] {
+  const urls: string[] = [];
+  const seen = new Set<string>();
+  
+  // Background images (most common in t.me/s/)
+  const bgMatches = block.matchAll(/background-image:url\('([^']+)'\)/g);
+  for (const match of bgMatches) {
+    if (match[1] && !seen.has(match[1])) {
+      urls.push(match[1]);
+      seen.add(match[1]);
+    }
+  }
+  
+  // Direct img src
+  const imgMatches = block.matchAll(/<img[^>]+src="([^"]+)"[^>]*>/gi);
+  for (const match of imgMatches) {
+    if (match[1] && !seen.has(match[1])) {
+      urls.push(match[1]);
+      seen.add(match[1]);
+    }
+  }
+  
+  // Video posters (thumbnails)
+  const posterMatches = block.matchAll(/<video[^>]+poster="([^"]+)"[^>]*>/gi);
+  for (const match of posterMatches) {
+    if (match[1] && !seen.has(match[1])) {
+      urls.push(match[1]);
+      seen.add(match[1]);
+    }
+  }
+  
+  return urls;
+}
+
+// Extract video info from block
+function extractVideoFromBlock(block: string): { url?: string; duration?: number } {
+  // Look for video element with src
+  const videoMatch = block.match(/<video[^>]+src="([^"]+)"[^>]*>/i);
+  if (!videoMatch?.[1]) return {};
+  
+  const url = videoMatch[1];
+  
+  // Try to extract duration from data-duration attribute or other places
+  const durationMatch = block.match(/data-duration="(\d+)"/);
+  const duration = durationMatch ? parseInt(durationMatch[1]) : undefined;
+  
+  return { url, duration };
+}
+
 async function fetchChannelPage(channel: string, beforeId?: number): Promise<string> {
   const url = beforeId ? `https://t.me/s/${channel}?before=${beforeId}` : `https://t.me/s/${channel}`;
   const res = await fetch(url, {
@@ -126,8 +179,20 @@ async function scrapeChannel(channel: string, afterId = 0): Promise<ScrapedMessa
             .trim();
         }
 
-        const photoUrl = extractPhotoUrlFromBlock(block);
-        messages.push({ id: msgId, text, photoUrl });
+        // Extract all media from the message
+        const allPhotos = extractAllPhotosFromBlock(block);
+        const videoInfo = extractVideoFromBlock(block);
+        
+        const hasMedia = allPhotos.length > 0 || videoInfo.url !== undefined;
+        
+        messages.push({ 
+          id: msgId, 
+          text, 
+          photoUrls: allPhotos.length > 0 ? allPhotos : undefined,
+          videoUrl: videoInfo.url,
+          videoDuration: videoInfo.duration,
+          hasMedia 
+        });
       }
 
       if (!foundAny) break;
@@ -192,84 +257,42 @@ async function downloadMedia(url: string): Promise<Uint8Array | null> {
   }
 }
 
-// ── Send to output Telegram channel ─────────────────────────────────────
-// Returns the telegram message_id if successful
-async function sendToTelegram(text: string, photoUrl?: string): Promise<number | null> {
+// ── Helper: Build multipart form data ────────────────────────────────────
+function buildMultipartForm(fields: { name: string; value: string | Uint8Array; filename?: string; contentType?: string }[], boundary: string): Uint8Array {
+  const encoder = new TextEncoder();
+  const parts: Uint8Array[] = [];
+  
+  for (const field of fields) {
+    parts.push(encoder.encode(`--${boundary}\r\n`));
+    
+    if (field.filename) {
+      parts.push(encoder.encode(`Content-Disposition: form-data; name="${field.name}"; filename="${field.filename}"\r\n`));
+      parts.push(encoder.encode(`Content-Type: ${field.contentType || 'application/octet-stream'}\r\n\r\n`));
+      parts.push(field.value as Uint8Array);
+    } else {
+      parts.push(encoder.encode(`Content-Disposition: form-data; name="${field.name}"\r\n\r\n`));
+      parts.push(encoder.encode(field.value as string));
+    }
+    parts.push(encoder.encode(`\r\n`));
+  }
+  
+  parts.push(encoder.encode(`--${boundary}--\r\n`));
+  
+  let totalLength = 0;
+  for (const part of parts) totalLength += part.length;
+  const body = new Uint8Array(totalLength);
+  let offset = 0;
+  for (const part of parts) {
+    body.set(part, offset);
+    offset += part.length;
+  }
+  return body;
+}
+
+// ── Send text-only ────────────────────────────────────────────────────────
+async function sendTextToTelegram(text: string): Promise<number | null> {
   if (!OUTPUT_CHAT_ID || !BOT_TOKEN) return null;
   try {
-    // If we have a photo URL, download and re-upload it
-    if (photoUrl) {
-      console.log(`[Telegram] Downloading media from: ${photoUrl.substring(0, 50)}...`);
-      const mediaData = await downloadMedia(photoUrl);
-      
-      if (mediaData) {
-        // Build multipart form data for upload
-        const boundary = '----FormBoundary' + Math.random().toString(36).substring(2);
-        const encoder = new TextEncoder();
-        
-        // Build form data parts
-        const parts: Uint8Array[] = [];
-        
-        // Add chat_id
-        parts.push(encoder.encode(`--${boundary}\r\n`));
-        parts.push(encoder.encode(`Content-Disposition: form-data; name="chat_id"\r\n\r\n`));
-        parts.push(encoder.encode(`${OUTPUT_CHAT_ID}\r\n`));
-        
-        // Add caption
-        parts.push(encoder.encode(`--${boundary}\r\n`));
-        parts.push(encoder.encode(`Content-Disposition: form-data; name="caption"\r\n\r\n`));
-        parts.push(encoder.encode(`${text.substring(0, 1024)}\r\n`));
-        
-        // Add parse_mode
-        parts.push(encoder.encode(`--${boundary}\r\n`));
-        parts.push(encoder.encode(`Content-Disposition: form-data; name="parse_mode"\r\n\r\n`));
-        parts.push(encoder.encode(`HTML\r\n`));
-        
-        // Add photo file
-        const filename = 'image.jpg';
-        parts.push(encoder.encode(`--${boundary}\r\n`));
-        parts.push(encoder.encode(`Content-Disposition: form-data; name="photo"; filename="${filename}"\r\n`));
-        parts.push(encoder.encode(`Content-Type: image/jpeg\r\n\r\n`));
-        parts.push(mediaData);
-        parts.push(encoder.encode(`\r\n`));
-        
-        // End boundary
-        parts.push(encoder.encode(`--${boundary}--\r\n`));
-        
-        // Combine all parts
-        let totalLength = 0;
-        for (const part of parts) totalLength += part.length;
-        const body = new Uint8Array(totalLength);
-        let offset = 0;
-        for (const part of parts) {
-          body.set(part, offset);
-          offset += part.length;
-        }
-        
-        // Send with multipart/form-data
-        const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto`, {
-          method: 'POST',
-          headers: { 
-            'Content-Type': `multipart/form-data; boundary=${boundary}`,
-          },
-          body,
-        });
-        
-        const data = await res.json();
-        if (data.ok && data.result?.message_id) {
-          console.log(`[Telegram] Photo uploaded successfully, msg_id: ${data.result.message_id}`);
-          return data.result.message_id;
-        }
-        console.warn('[Telegram] Upload failed:', data.description);
-      } else {
-        console.warn('[Telegram] Failed to download media, falling back to text');
-      }
-      
-      // If photo upload failed, fall back to text-only
-      console.log('[Telegram] Falling back to text-only message');
-    }
-    
-    // Text-only send
     const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -279,13 +302,166 @@ async function sendToTelegram(text: string, photoUrl?: string): Promise<number |
     if (data.ok && data.result?.message_id) {
       return data.result.message_id;
     }
-    if (!data.ok) {
-      console.error('[Telegram] sendMessage failed:', data.description);
-    }
+    console.error('[Telegram] sendMessage failed:', data.description);
   } catch (e) {
-    console.error('[Telegram] send error:', e);
+    console.error('[Telegram] sendText error:', e);
   }
   return null;
+}
+
+// ── Send single photo ────────────────────────────────────────────────────
+async function sendPhotoToTelegram(text: string, photoUrl: string): Promise<number | null> {
+  if (!OUTPUT_CHAT_ID || !BOT_TOKEN) return null;
+  try {
+    console.log(`[Telegram] Downloading photo: ${photoUrl.substring(0, 50)}...`);
+    const mediaData = await downloadMedia(photoUrl);
+    
+    if (!mediaData) {
+      console.warn('[Telegram] Failed to download photo, falling back to text');
+      return sendTextToTelegram(text);
+    }
+    
+    const boundary = '----FormBoundary' + Math.random().toString(36).substring(2);
+    const body = buildMultipartForm([
+      { name: 'chat_id', value: OUTPUT_CHAT_ID },
+      { name: 'caption', value: text.substring(0, 1024) },
+      { name: 'parse_mode', value: 'HTML' },
+      { name: 'photo', value: mediaData, filename: 'image.jpg', contentType: 'image/jpeg' },
+    ], boundary);
+    
+    const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto`, {
+      method: 'POST',
+      headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` },
+      body: body as any,
+    });
+    
+    const data = await res.json();
+    if (data.ok && data.result?.message_id) {
+      console.log(`[Telegram] Photo sent, msg_id: ${data.result.message_id}`);
+      return data.result.message_id;
+    }
+    console.warn('[Telegram] sendPhoto failed:', data.description);
+    return sendTextToTelegram(text);
+  } catch (e) {
+    console.error('[Telegram] sendPhoto error:', e);
+    return sendTextToTelegram(text);
+  }
+}
+
+// ── Send album (multiple photos) ───────────────────────────────────────────
+async function sendAlbumToTelegram(text: string, photoUrls: string[]): Promise<number | null> {
+  if (!OUTPUT_CHAT_ID || !BOT_TOKEN) return null;
+  try {
+    console.log(`[Telegram] Processing album with ${photoUrls.length} photos...`);
+    
+    // Download all photos
+    const mediaItems: { url: string; data: Uint8Array | null }[] = [];
+    for (const url of photoUrls) {
+      const data = await downloadMedia(url);
+      mediaItems.push({ url, data });
+      await new Promise(r => setTimeout(r, 100)); // Rate limit protection
+    }
+    
+    const validPhotos = mediaItems.filter(item => item.data !== null);
+    console.log(`[Telegram] Downloaded ${validPhotos.length}/${photoUrls.length} photos`);
+    
+    if (validPhotos.length === 0) {
+      return sendTextToTelegram(text);
+    }
+    
+    if (validPhotos.length === 1) {
+      // Single photo fallback
+      return sendPhotoToTelegram(text, validPhotos[0].url);
+    }
+    
+    // Build media group - caption only on first item
+    const boundary = '----FormBoundary' + Math.random().toString(36).substring(2);
+    const fields: { name: string; value: string | Uint8Array; filename?: string; contentType?: string }[] = [
+      { name: 'chat_id', value: OUTPUT_CHAT_ID },
+    ];
+    
+    // Build media array JSON
+    const mediaArray = validPhotos.map((photo, index) => ({
+      type: 'photo',
+      media: `attach://photo${index}`,
+      caption: index === 0 ? text.substring(0, 1024) : undefined,
+      parse_mode: index === 0 ? 'HTML' : undefined,
+    }));
+    fields.push({ name: 'media', value: JSON.stringify(mediaArray) });
+    
+    // Add photo files
+    validPhotos.forEach((photo, index) => {
+      fields.push({
+        name: `photo${index}`,
+        value: photo.data!,
+        filename: `photo${index}.jpg`,
+        contentType: 'image/jpeg'
+      });
+    });
+    
+    const body = buildMultipartForm(fields, boundary);
+    
+    const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMediaGroup`, {
+      method: 'POST',
+      headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` },
+      body: body as any,
+    });
+    
+    const data = await res.json();
+    if (data.ok && data.result?.length > 0) {
+      console.log(`[Telegram] Album sent (${validPhotos.length} photos), first msg_id: ${data.result[0].message_id}`);
+      return data.result[0].message_id;
+    }
+    console.warn('[Telegram] sendMediaGroup failed:', data.description);
+    
+    // Fallback: send first photo with caption
+    return sendPhotoToTelegram(text, validPhotos[0].url);
+  } catch (e) {
+    console.error('[Telegram] sendAlbum error:', e);
+    return sendTextToTelegram(text);
+  }
+}
+
+// ── Send video ───────────────────────────────────────────────────────────
+async function sendVideoToTelegram(text: string, videoUrl: string): Promise<number | null> {
+  if (!OUTPUT_CHAT_ID || !BOT_TOKEN) return null;
+  try {
+    console.log(`[Telegram] Downloading video: ${videoUrl.substring(0, 50)}...`);
+    const mediaData = await downloadMedia(videoUrl);
+    
+    if (!mediaData) {
+      console.warn('[Telegram] Failed to download video, falling back to text');
+      return sendTextToTelegram(text);
+    }
+    
+    console.log(`[Telegram] Video downloaded: ${(mediaData.length / 1024 / 1024).toFixed(2)} MB`);
+    
+    const boundary = '----FormBoundary' + Math.random().toString(36).substring(2);
+    const body = buildMultipartForm([
+      { name: 'chat_id', value: OUTPUT_CHAT_ID },
+      { name: 'caption', value: text.substring(0, 1024) },
+      { name: 'parse_mode', value: 'HTML' },
+      { name: 'supports_streaming', value: 'true' },
+      { name: 'video', value: mediaData, filename: 'video.mp4', contentType: 'video/mp4' },
+    ], boundary);
+    
+    const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendVideo`, {
+      method: 'POST',
+      headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` },
+      body: body as any,
+    });
+    
+    const data = await res.json();
+    if (data.ok && data.result?.message_id) {
+      console.log(`[Telegram] Video sent, msg_id: ${data.result.message_id}`);
+      return data.result.message_id;
+    }
+    console.warn('[Telegram] sendVideo failed:', data.description);
+    return sendTextToTelegram(text);
+  } catch (e) {
+    console.error('[Telegram] sendVideo error:', e);
+    return sendTextToTelegram(text);
+  }
 }
 
 // ── Main handler ──────────────────────────────────────────────────────────
@@ -333,7 +509,7 @@ Deno.serve(async (req) => {
         processedCount++;
         maxMsgId = Math.max(maxMsgId, msg.id);
 
-        if (msg.text.length < 20 && !msg.photoUrl) continue;
+        if (msg.text.length < 20 && !msg.hasMedia) continue;
 
         // ── Deduplication: use original_url (t.me/channel/msgId) as unique key
         const originalUrl = `https://t.me/${channel}/${msg.id}`;
@@ -370,7 +546,24 @@ Deno.serve(async (req) => {
         const textWithCredit = `${finalContent}\n\n📢 @izynews`;
 
         // ── Publish to Telegram channel FIRST (to get message_id)
-        const telegramMsgId = await sendToTelegram(textWithCredit, msg.photoUrl);
+        // Check for short video (< 60 seconds)
+        const isShortVideo = msg.videoUrl && msg.videoDuration && msg.videoDuration <= 60;
+        
+        let telegramMsgId: number | null = null;
+        
+        if (isShortVideo && msg.videoUrl) {
+          // Send video
+          telegramMsgId = await sendVideoToTelegram(textWithCredit, msg.videoUrl);
+        } else if (msg.photoUrls && msg.photoUrls.length > 1) {
+          // Send album (multiple photos)
+          telegramMsgId = await sendAlbumToTelegram(textWithCredit, msg.photoUrls);
+        } else if (msg.photoUrls && msg.photoUrls.length === 1) {
+          // Single photo
+          telegramMsgId = await sendPhotoToTelegram(textWithCredit, msg.photoUrls[0]);
+        } else {
+          // Text only
+          telegramMsgId = await sendTextToTelegram(textWithCredit);
+        }
         if (!telegramMsgId) {
           console.warn(`[Aggregate] Failed to publish msg ${msg.id} to Telegram, skipping DB insert`);
           continue;
