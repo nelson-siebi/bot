@@ -12,6 +12,31 @@ function isAdmin(id: number | string): boolean {
   return ADMIN_IDS.includes(String(id));
 }
 
+async function getOrCreateAppUser(supabase: any, telegramUserId: number, username?: string) {
+  const { data: existing, error: selErr } = await supabase
+    .from('app_users')
+    .select('*')
+    .eq('telegram_user_id', telegramUserId)
+    .maybeSingle();
+  if (selErr) throw selErr;
+  if (existing) return existing;
+
+  const { data: inserted, error: insErr } = await supabase
+    .from('app_users')
+    .insert({ telegram_user_id: telegramUserId, username: username || null, is_admin: false })
+    .select('*')
+    .maybeSingle();
+  if (insErr) throw insErr;
+  return inserted;
+}
+
+function isPremium(user: any): boolean {
+  if (!user) return false;
+  if (user.plan !== 'premium') return false;
+  if (!user.plan_expires_at) return true;
+  return new Date(user.plan_expires_at).getTime() > Date.now();
+}
+
 async function reply(chatId: number | string, text: string, extra: Record<string, unknown> = {}) {
   try {
     const res = await fetch(`${BASE}/sendMessage`, {
@@ -115,16 +140,11 @@ Deno.serve(async (req) => {
 
   const chatId = (message.chat as any)?.id as number;
   const userId = (message.from as any)?.id as number;
+  const username = ((message.from as any)?.username as string | undefined) || undefined;
   const messageId = message.message_id as number;
   const text = ((message.text || message.caption || '') as string).trim();
   const photo = (message.photo as any[]) || null;
   const hasMedia = !!(photo || message.video || message.document || message.audio || message.animation || message.voice);
-
-  // ── Security ──────────────────────────────────────────────────────────────
-  if (!isAdmin(chatId) && !isAdmin(userId)) {
-    await reply(chatId, '⛔ Accès refusé.');
-    return new Response('OK', { status: 200 });
-  }
 
   const supabase = createClient(
     Deno.env.get('SUPABASE_URL') ?? '',
@@ -135,7 +155,71 @@ Deno.serve(async (req) => {
   const command = parts[0]?.toLowerCase() || '';
   const args = parts.slice(1);
 
+  const adminMode = isAdmin(chatId) || isAdmin(userId);
+
   try {
+    // ── Ensure app user exists for non-admins ─────────────────────────────
+    let appUser: any = null;
+    if (!adminMode) {
+      appUser = await getOrCreateAppUser(supabase, userId, username);
+    }
+
+    // ── User commands (non-admin allowed) ─────────────────────────────────
+    if (!adminMode && (command === '/start' || command === '/help' || !command)) {
+      const premium = isPremium(appUser);
+      await reply(
+        chatId,
+        `👋 Bienvenue !\n\n` +
+          `Plan: <b>${premium ? 'Premium' : 'Gratuit'}</b>\n` +
+          `- Gratuit: 1 flux (1 source → 1 canal cible), 5 analyses/jour\n` +
+          `- Premium: illimité (500 FCFA / mois)\n\n` +
+          `Commandes:\n` +
+          `<code>/me</code> — Mon compte\n` +
+          `<code>/subscribe</code> — S'abonner\n\n` +
+          `ℹ️ Pour publier vers ton canal, ajoute ce bot comme admin dans ton canal cible.`
+      );
+      return new Response('OK', { status: 200 });
+    }
+
+    if (!adminMode && command === '/me') {
+      const premium = isPremium(appUser);
+      const today = new Date().toISOString().slice(0, 10);
+      const { data: usage } = await supabase
+        .from('usage_daily')
+        .select('analyzed_count')
+        .eq('user_id', appUser.id)
+        .eq('day', today)
+        .maybeSingle();
+      const used = usage?.analyzed_count ?? 0;
+      const limit = premium ? '∞' : '5';
+      await reply(
+        chatId,
+        `👤 <b>Mon compte</b>\n\n` +
+          `Plan: <b>${premium ? 'Premium' : 'Gratuit'}</b>\n` +
+          `Analyses aujourd'hui: <b>${used}/${limit}</b>\n\n` +
+          `${premium && appUser.plan_expires_at ? `Expire: <b>${String(appUser.plan_expires_at).slice(0, 10)}</b>\n\n` : ''}` +
+          `Pour t'abonner: <code>/subscribe</code>`
+      );
+      return new Response('OK', { status: 200 });
+    }
+
+    if (!adminMode && command === '/subscribe') {
+      await reply(
+        chatId,
+        `💳 <b>Abonnement Premium</b>\n\n` +
+          `Prix: <b>500 FCFA / mois</b>\n` +
+          `Avantages: flux illimités, plusieurs canaux/sources.\n\n` +
+          `⏳ Paiement Nelsius Pay: en cours d'intégration.`
+      );
+      return new Response('OK', { status: 200 });
+    }
+
+    // ── Admin-only security gate ──────────────────────────────────────────
+    if (!adminMode) {
+      await reply(chatId, '⛔ Accès refusé.');
+      return new Response('OK', { status: 200 });
+    }
+
     // ── /start | /help ────────────────────────────────────────────────────
     if (command === '/start' || command === '/help' || !command) {
       await reply(chatId, HELP);
