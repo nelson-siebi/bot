@@ -1,6 +1,4 @@
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
-import { S3Client, PutObjectCommand, GetObjectCommand } from 'https://esm.sh/@aws-sdk/client-s3@3.758.0?target=deno'
-import { getSignedUrl } from 'https://esm.sh/@aws-sdk/s3-request-presigner@3.758.0?target=deno'
 
 const BOT_TOKEN = Deno.env.get('TELEGRAM_BOT_TOKEN') || '';
 const OUTPUT_CHAT_ID = Deno.env.get('TELEGRAM_CHAT_ID') || '';
@@ -13,17 +11,74 @@ const STORJ_ENDPOINT = Deno.env.get('STORJ_ENDPOINT') || 'https://gateway.storjs
 const STORJ_BUCKET = Deno.env.get('STORJ_BUCKET') || '';
 const STORJ_REGION = 'us-east-1'; // Storj uses this region by default
 
-function getStorjS3Client(): S3Client | null {
-  if (!STORJ_ACCESS_KEY || !STORJ_SECRET_KEY || !STORJ_BUCKET) return null;
-  return new S3Client({
-    region: STORJ_REGION,
-    endpoint: STORJ_ENDPOINT,
-    forcePathStyle: true,
-    credentials: {
-      accessKeyId: STORJ_ACCESS_KEY,
-      secretAccessKey: STORJ_SECRET_KEY,
-    },
-  });
+function isStorjConfigured(): boolean {
+  return Boolean(STORJ_ACCESS_KEY && STORJ_SECRET_KEY && STORJ_BUCKET && STORJ_ENDPOINT);
+}
+
+function toHex(bytes: Uint8Array): string {
+  return Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+function utf8Bytes(s: string): Uint8Array {
+  return new TextEncoder().encode(s);
+}
+
+function toArrayBuffer(view: Uint8Array): ArrayBuffer {
+  return view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength) as ArrayBuffer;
+}
+
+async function sha256(data: Uint8Array | string): Promise<Uint8Array> {
+  const bytes = typeof data === 'string' ? utf8Bytes(data) : data;
+  const digest = await crypto.subtle.digest('SHA-256', toArrayBuffer(bytes));
+  return new Uint8Array(digest);
+}
+
+async function hmacSha256(key: Uint8Array, data: string): Promise<Uint8Array> {
+  const cryptoKey = await crypto.subtle.importKey(
+    'raw',
+    toArrayBuffer(key),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign'],
+  );
+  const sig = await crypto.subtle.sign('HMAC', cryptoKey, toArrayBuffer(utf8Bytes(data)));
+  return new Uint8Array(sig);
+}
+
+function amzDate(now = new Date()): { amz: string; short: string } {
+  const yyyy = now.getUTCFullYear();
+  const mm = String(now.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(now.getUTCDate()).padStart(2, '0');
+  const HH = String(now.getUTCHours()).padStart(2, '0');
+  const MM = String(now.getUTCMinutes()).padStart(2, '0');
+  const SS = String(now.getUTCSeconds()).padStart(2, '0');
+  const short = `${yyyy}${mm}${dd}`;
+  const amz = `${short}T${HH}${MM}${SS}Z`;
+  return { amz, short };
+}
+
+function encodeRfc3986(str: string): string {
+  return encodeURIComponent(str).replace(/[!'()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+}
+
+function canonicalUriPathStyle(bucket: string, key: string): string {
+  const parts = [`/${bucket}`].concat(key.split('/').map(encodeRfc3986));
+  return parts.join('/').replace(/\/+/g, '/');
+}
+
+async function getSigningKey(secretKey: string, dateShort: string, region: string, service: string): Promise<Uint8Array> {
+  const kDate = await hmacSha256(utf8Bytes(`AWS4${secretKey}`), dateShort);
+  const kRegion = await hmacSha256(kDate, region);
+  const kService = await hmacSha256(kRegion, service);
+  const kSigning = await hmacSha256(kService, 'aws4_request');
+  return kSigning;
+}
+
+function buildCanonicalQuery(params: Record<string, string>): string {
+  return Object.keys(params)
+    .sort()
+    .map((k) => `${encodeRfc3986(k)}=${encodeRfc3986(params[k])}`)
+    .join('&');
 }
 
 interface ScrapedMessage {
@@ -284,32 +339,85 @@ async function restructureWithAI(rawText: string): Promise<{ title: string; cont
   return { title: '', content: rawText, isAd: false };
 }
 
-// ── Upload to Storj (S3) + return SIGNED URL for Telegram ───────────────
+// ── Upload to Storj (S3 REST + SigV4) + presigned GET URL for Telegram ──
 async function uploadToStorjAndGetSignedUrl(
   buffer: Uint8Array,
   filename: string,
   contentType: string,
 ): Promise<string | null> {
-  const s3 = getStorjS3Client();
-  if (!s3) return null;
+  if (!isStorjConfigured()) {
+    console.warn('[Storj] Not configured (missing env vars), skipping Storj upload');
+    return null;
+  }
+
+  const endpoint = new URL(STORJ_ENDPOINT);
+  const host = endpoint.host;
+  const service = 's3';
+
+  const key = `${Date.now()}_${Math.random().toString(36).slice(2)}_${filename}`;
+  const canonicalUri = canonicalUriPathStyle(STORJ_BUCKET, key);
 
   try {
-    const uniqueFilename = `${Date.now()}_${Math.random().toString(36).slice(2)}_${filename}`;
-    await s3.send(new PutObjectCommand({
-      Bucket: STORJ_BUCKET,
-      Key: uniqueFilename,
-      Body: buffer,
-      ContentType: contentType,
-    }));
+    const { amz, short } = amzDate();
+    const payloadHash = toHex(await sha256(buffer));
 
-    const signedUrl = await getSignedUrl(
-      s3,
-      new GetObjectCommand({ Bucket: STORJ_BUCKET, Key: uniqueFilename }),
-      { expiresIn: 60 * 60 },
-    );
+    const canonicalHeaders =
+      `content-type:${contentType}\n` +
+      `host:${host}\n` +
+      `x-amz-content-sha256:${payloadHash}\n` +
+      `x-amz-date:${amz}\n`;
+    const signedHeaders = 'content-type;host;x-amz-content-sha256;x-amz-date';
 
-    console.log(`[Storj] Uploaded: ${uniqueFilename} (${(buffer.length / 1024 / 1024).toFixed(2)} MB)`);
-    return signedUrl;
+    const canonicalRequest =
+      `PUT\n${canonicalUri}\n\n${canonicalHeaders}\n${signedHeaders}\n${payloadHash}`;
+
+    const algorithm = 'AWS4-HMAC-SHA256';
+    const credentialScope = `${short}/${STORJ_REGION}/${service}/aws4_request`;
+    const stringToSign =
+      `${algorithm}\n${amz}\n${credentialScope}\n${toHex(await sha256(canonicalRequest))}`;
+
+    const signingKey = await getSigningKey(STORJ_SECRET_KEY, short, STORJ_REGION, service);
+    const signature = toHex(await hmacSha256(signingKey, stringToSign));
+    const authorization =
+      `${algorithm} Credential=${STORJ_ACCESS_KEY}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
+
+    const putUrl = `${endpoint.origin}${canonicalUri}`;
+    const putRes = await fetch(putUrl, {
+      method: 'PUT',
+      headers: {
+        'content-type': contentType,
+        'x-amz-date': amz,
+        'x-amz-content-sha256': payloadHash,
+        'authorization': authorization,
+      },
+      body: buffer as any,
+    });
+
+    if (!putRes.ok) {
+      const errText = await putRes.text().catch(() => '');
+      console.error('[Storj] PUT failed:', putRes.status, errText?.slice(0, 300));
+      return null;
+    }
+
+    // Presigned GET for 1 hour so Telegram can download the object.
+    const expires = 60 * 60;
+    const getParams: Record<string, string> = {
+      'X-Amz-Algorithm': algorithm,
+      'X-Amz-Credential': `${STORJ_ACCESS_KEY}/${credentialScope}`,
+      'X-Amz-Date': amz,
+      'X-Amz-Expires': String(expires),
+      'X-Amz-SignedHeaders': 'host',
+    };
+    const canonicalQuery = buildCanonicalQuery(getParams);
+    const getCanonicalRequest =
+      `GET\n${canonicalUri}\n${canonicalQuery}\nhost:${host}\n\nhost\nUNSIGNED-PAYLOAD`;
+    const getStringToSign =
+      `${algorithm}\n${amz}\n${credentialScope}\n${toHex(await sha256(getCanonicalRequest))}`;
+    const getSignature = toHex(await hmacSha256(signingKey, getStringToSign));
+
+    const signedGetUrl = `${endpoint.origin}${canonicalUri}?${canonicalQuery}&X-Amz-Signature=${getSignature}`;
+    console.log(`[Storj] Uploaded: ${key} (${(buffer.length / 1024 / 1024).toFixed(2)} MB)`);
+    return signedGetUrl;
   } catch (e) {
     console.error('[Storj] Upload/sign error:', e);
     return null;
