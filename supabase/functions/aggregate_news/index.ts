@@ -174,41 +174,113 @@ async function restructureWithAI(rawText: string): Promise<{ title: string; cont
   return { title: '', content: rawText, isAd: false };
 }
 
+// ── Download media from URL ──────────────────────────────────────────────
+async function downloadMedia(url: string): Promise<Uint8Array | null> {
+  try {
+    const res = await fetch(url, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+    });
+    if (!res.ok) {
+      console.error(`[Download] HTTP ${res.status} for ${url}`);
+      return null;
+    }
+    const buffer = await res.arrayBuffer();
+    return new Uint8Array(buffer);
+  } catch (e) {
+    console.error('[Download] Error:', e);
+    return null;
+  }
+}
+
 // ── Send to output Telegram channel ─────────────────────────────────────
 // Returns the telegram message_id if successful
 async function sendToTelegram(text: string, photoUrl?: string): Promise<number | null> {
   if (!OUTPUT_CHAT_ID || !BOT_TOKEN) return null;
   try {
-    let res;
+    // If we have a photo URL, download and re-upload it
     if (photoUrl) {
-      res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: OUTPUT_CHAT_ID,
-          photo: photoUrl,
-          caption: text.substring(0, 1024),
-          parse_mode: 'HTML',
-        }),
-      });
-    } else {
-      res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: OUTPUT_CHAT_ID, text: text.substring(0, 4096), parse_mode: 'HTML' }),
-      });
+      console.log(`[Telegram] Downloading media from: ${photoUrl.substring(0, 50)}...`);
+      const mediaData = await downloadMedia(photoUrl);
+      
+      if (mediaData) {
+        // Build multipart form data for upload
+        const boundary = '----FormBoundary' + Math.random().toString(36).substring(2);
+        const encoder = new TextEncoder();
+        
+        // Build form data parts
+        const parts: Uint8Array[] = [];
+        
+        // Add chat_id
+        parts.push(encoder.encode(`--${boundary}\r\n`));
+        parts.push(encoder.encode(`Content-Disposition: form-data; name="chat_id"\r\n\r\n`));
+        parts.push(encoder.encode(`${OUTPUT_CHAT_ID}\r\n`));
+        
+        // Add caption
+        parts.push(encoder.encode(`--${boundary}\r\n`));
+        parts.push(encoder.encode(`Content-Disposition: form-data; name="caption"\r\n\r\n`));
+        parts.push(encoder.encode(`${text.substring(0, 1024)}\r\n`));
+        
+        // Add parse_mode
+        parts.push(encoder.encode(`--${boundary}\r\n`));
+        parts.push(encoder.encode(`Content-Disposition: form-data; name="parse_mode"\r\n\r\n`));
+        parts.push(encoder.encode(`HTML\r\n`));
+        
+        // Add photo file
+        const filename = 'image.jpg';
+        parts.push(encoder.encode(`--${boundary}\r\n`));
+        parts.push(encoder.encode(`Content-Disposition: form-data; name="photo"; filename="${filename}"\r\n`));
+        parts.push(encoder.encode(`Content-Type: image/jpeg\r\n\r\n`));
+        parts.push(mediaData);
+        parts.push(encoder.encode(`\r\n`));
+        
+        // End boundary
+        parts.push(encoder.encode(`--${boundary}--\r\n`));
+        
+        // Combine all parts
+        let totalLength = 0;
+        for (const part of parts) totalLength += part.length;
+        const body = new Uint8Array(totalLength);
+        let offset = 0;
+        for (const part of parts) {
+          body.set(part, offset);
+          offset += part.length;
+        }
+        
+        // Send with multipart/form-data
+        const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto`, {
+          method: 'POST',
+          headers: { 
+            'Content-Type': `multipart/form-data; boundary=${boundary}`,
+          },
+          body,
+        });
+        
+        const data = await res.json();
+        if (data.ok && data.result?.message_id) {
+          console.log(`[Telegram] Photo uploaded successfully, msg_id: ${data.result.message_id}`);
+          return data.result.message_id;
+        }
+        console.warn('[Telegram] Upload failed:', data.description);
+      } else {
+        console.warn('[Telegram] Failed to download media, falling back to text');
+      }
+      
+      // If photo upload failed, fall back to text-only
+      console.log('[Telegram] Falling back to text-only message');
     }
+    
+    // Text-only send
+    const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: OUTPUT_CHAT_ID, text: text.substring(0, 4096), parse_mode: 'HTML' }),
+    });
     const data = await res.json();
     if (data.ok && data.result?.message_id) {
       return data.result.message_id;
     }
-    if (!data.ok && photoUrl) {
-      console.warn('[Telegram] sendPhoto failed, falling back to text:', data.description);
-      // Fallback to text-only
-      return await sendToTelegram(text);
-    }
     if (!data.ok) {
-      console.error('[Telegram] send failed:', data.description || await res.text());
+      console.error('[Telegram] sendMessage failed:', data.description);
     }
   } catch (e) {
     console.error('[Telegram] send error:', e);
