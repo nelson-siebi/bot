@@ -74,52 +74,75 @@ function extractPhotoUrlFromBlock(block: string): string | undefined {
   return undefined;
 }
 
-// Extract ALL photos from an album message
+// Extract ALL photos from an album message - STRICT filtering
 function extractAllPhotosFromBlock(block: string): string[] {
   const urls: string[] = [];
   const seen = new Set<string>();
   
-  // Background images (most common in t.me/s/)
-  const bgMatches = block.matchAll(/background-image:url\('([^']+)'\)/g);
-  for (const match of bgMatches) {
-    if (match[1] && !seen.has(match[1])) {
-      urls.push(match[1]);
-      seen.add(match[1]);
+  // Find the main media container for this message
+  const mediaContainer = block.match(/class="tgme_widget_message_photo_wrap[^"]*"[^>]*>/g);
+  if (!mediaContainer) return [];
+  
+  // Look for grouped media (album indicator)
+  const isAlbum = block.includes('tgme_widget_message_grouped_wrap') || 
+                  block.includes('tgme_widget_message_album');
+  
+  // Extract photos from grouped containers (albums)
+  if (isAlbum) {
+    // Find all photo containers in grouped layout
+    const photoBlocks = block.matchAll(/class="tgme_widget_message_photo_wrap[^"]*"[^>]*>/g);
+    for (const photoBlock of photoBlocks) {
+      const bgMatch = photoBlock[0].match(/background-image:url\('([^']+)'\)/);
+      if (bgMatch?.[1] && !seen.has(bgMatch[1])) {
+        urls.push(bgMatch[1]);
+        seen.add(bgMatch[1]);
+      }
     }
   }
   
-  // Direct img src
-  const imgMatches = block.matchAll(/<img[^>]+src="([^"]+)"[^>]*>/gi);
-  for (const match of imgMatches) {
-    if (match[1] && !seen.has(match[1])) {
-      urls.push(match[1]);
-      seen.add(match[1]);
+  // Single photo or backup extraction
+  if (urls.length === 0) {
+    // Extract from the main widget_photo div only (not nested)
+    const photoSection = block.match(/<a[^>]*class="tgme_widget_message_photo_wrap[^"]*"[^>]*background-image:url\('([^']+)'\)/);
+    if (photoSection?.[1] && !seen.has(photoSection[1])) {
+      urls.push(photoSection[1]);
+      seen.add(photoSection[1]);
+    }
+    
+    // Fallback: find background in style attribute (first one only)
+    if (urls.length === 0) {
+      const bgMatch = block.match(/background-image:url\('([^']+\/(?:photos|video_thumbnails)\/[^']+)'\)/);
+      if (bgMatch?.[1] && !seen.has(bgMatch[1])) {
+        urls.push(bgMatch[1]);
+        seen.add(bgMatch[1]);
+      }
     }
   }
   
-  // Video posters (thumbnails)
-  const posterMatches = block.matchAll(/<video[^>]+poster="([^"]+)"[^>]*>/gi);
-  for (const match of posterMatches) {
-    if (match[1] && !seen.has(match[1])) {
-      urls.push(match[1]);
-      seen.add(match[1]);
-    }
-  }
-  
-  return urls;
+  // Clean URLs - remove size constraints for full quality
+  return urls.map(url => url.replace(/\?size=[^&]*/, '').replace(/&size=[^&]*/, ''));
 }
 
-// Extract video info from block
+// Extract video info from block - STRICT filtering
 function extractVideoFromBlock(block: string): { url?: string; duration?: number } {
-  // Look for video element with src
-  const videoMatch = block.match(/<video[^>]+src="([^"]+)"[^>]*>/i);
-  if (!videoMatch?.[1]) return {};
+  // Look for video element with src - must be inside tgme_widget_message_video
+  const videoSection = block.match(/class="tgme_widget_message_video[^"]*"[^>]*>.*?<video[^>]+src="([^"]+)"[^>]*>/is);
+  if (!videoSection?.[1]) return {};
   
-  const url = videoMatch[1];
+  const url = videoSection[1];
   
-  // Try to extract duration from data-duration attribute or other places
-  const durationMatch = block.match(/data-duration="(\d+)"/);
-  const duration = durationMatch ? parseInt(durationMatch[1]) : undefined;
+  // Try to extract duration from data-duration or time element
+  const durationMatch = block.match(/data-duration="(\d+)"/) || 
+                      block.match(/<time[^>]*>(\d+):(\d+)<\/time>/);
+  let duration: number | undefined;
+  if (durationMatch) {
+    if (durationMatch[2]) {
+      // MM:SS format
+      duration = parseInt(durationMatch[1]) * 60 + parseInt(durationMatch[2]);
+    } else {
+      duration = parseInt(durationMatch[1]);
+    }
+  }
   
   return { url, duration };
 }
@@ -552,13 +575,11 @@ Deno.serve(async (req) => {
         let telegramMsgId: number | null = null;
         
         if (isShortVideo && msg.videoUrl) {
-          // Send video
+          // Send video (short videos < 60s)
           telegramMsgId = await sendVideoToTelegram(textWithCredit, msg.videoUrl);
-        } else if (msg.photoUrls && msg.photoUrls.length > 1) {
-          // Send album (multiple photos)
-          telegramMsgId = await sendAlbumToTelegram(textWithCredit, msg.photoUrls);
-        } else if (msg.photoUrls && msg.photoUrls.length === 1) {
-          // Single photo
+        } else if (msg.photoUrls && msg.photoUrls.length > 0) {
+          // Send only the FIRST photo (not full album) - keeps it as single publication
+          console.log(`[Aggregate] Album detected with ${msg.photoUrls.length} photos, using first only`);
           telegramMsgId = await sendPhotoToTelegram(textWithCredit, msg.photoUrls[0]);
         } else {
           // Text only
