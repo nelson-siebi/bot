@@ -42,17 +42,24 @@ async function getOrCreateAppUser(
   return inserted;
 }
 
-function isPremium(user: any): boolean {
-  if (!user) return false;
-  if (user.plan !== "premium") return false;
+function isPlanActive(user: any, plans: string[]): boolean {
+  if (!user || !plans.includes(user.plan)) return false;
   if (!user.plan_expires_at) return true;
   return new Date(user.plan_expires_at).getTime() > Date.now();
+}
+
+function isPremium(user: any): boolean {
+  return isPlanActive(user, ["premium", "pro_plus"]);
+}
+
+function isProPlus(user: any): boolean {
+  return isPlanActive(user, ["pro_plus"]);
 }
 
 const DEFAULT_FLOW_FILTERS = {
   include_keywords: [],
   exclude_keywords: [],
-  block_ads: true,
+  block_ads: false,
   media_only: false,
   allow_text: true,
   allow_photos: true,
@@ -62,6 +69,11 @@ const DEFAULT_FLOW_FILTERS = {
   remove_links: false,
   remove_mentions: false,
   signature_text: "",
+  translate_enabled: false,
+  target_language: "fr",
+  replacements: {},
+  link_action: "keep",
+  link_replacement: "",
 };
 
 const USER_HELP = `🤖 <b>Bot Telegram Auto — Espace utilisateur</b>\n\nUtilise les boutons en bas pour gérer ton automatisation Telegram.\n\n<b>Scénario rapide</b>\n1. Clique sur <b>➕ Nouveau flux</b>\n2. Envoie le canal source\n3. Choisis ou ajoute le canal cible\n4. Le bot crée automatiquement le flux\n\n<b>Commandes disponibles</b>\n/addsource &lt;@canal&gt; — Ajouter une source\n/addtarget &lt;@canal ou -100...&gt; — Ajouter une cible\n/addflow &lt;source_id&gt; &lt;target_id&gt; — Créer un flux\n/flows — Mes flux\n/activity — Activité\n/subscribe — Premium`;
@@ -74,8 +86,9 @@ function userMenuMarkup() {
         ["⏸ Désactiver flux", "▶️ Réactiver flux"],
         ["📡 Mes sources", "🎯 Mes cibles"],
         ["📊 Activité", "👤 Mon compte"],
-        ["💳 Premium", "💰 Dépôt"],
-        ["❓ Aide"],
+        ["💳 Premium", "🚀 Pro Plus"],
+        ["💰 Dépôt", "🧾 Paiements"],
+        ["⚙️ Filtres Pro+", "❓ Aide"],
       ],
       resize_keyboard: true,
       one_time_keyboard: false,
@@ -90,6 +103,7 @@ function adminMenuMarkup() {
         ["▶️ Lancer agrégation", "📊 Stats"],
         ["➕ Source globale", "📡 Sources globales"],
         ["📰 Articles", "🧹 Nettoyage"],
+        ["📣 Notifier utilisateurs"],
         ["❓ Aide admin"],
       ],
       resize_keyboard: true,
@@ -136,7 +150,10 @@ function commandFromButton(label: string): string | null {
     "📊 Activité": "/activity",
     "👤 Mon compte": "/me",
     "💳 Premium": "/subscribe",
+    "🚀 Pro Plus": "/proplus",
     "💰 Dépôt": "/deposit",
+    "🧾 Paiements": "/payments",
+    "⚙️ Filtres Pro+": "/profilters",
     "❓ Aide": "/help",
     "▶️ Lancer agrégation": "/run",
     "📊 Stats": "/stats",
@@ -146,6 +163,7 @@ function commandFromButton(label: string): string | null {
     "🧹 Nettoyage": "/adminclean",
     "🗑 DB seulement": "/deleteall",
     "🔥 Tout supprimer": "/clearall",
+    "📣 Notifier utilisateurs": "/broadcast",
     "❓ Aide admin": "/help",
     "✅ J’ai ajouté le bot": "/verifytargetadmin",
     "❌ Annuler": "/cancel",
@@ -412,6 +430,7 @@ async function createNelsiusCheckout(
   appUser: any,
   paymentType: "subscription" | "deposit",
   amount: number,
+  plan: "premium" | "pro_plus" = "premium",
 ) {
   const secretKey = Deno.env.get("NELSIUS_SECRET_KEY") || "";
   if (!secretKey)
@@ -436,7 +455,7 @@ async function createNelsiusCheckout(
       currency: "XAF",
       status: "created",
       payment_type: paymentType,
-      metadata: { telegram_user_id: appUser.telegram_user_id },
+      metadata: { telegram_user_id: appUser.telegram_user_id, plan },
     })
     .select("id")
     .maybeSingle();
@@ -466,7 +485,14 @@ async function createNelsiusCheckout(
     const data = await res.json();
     const checkoutUrl = data?.data?.checkout_url || data?.checkout_url || null;
     const externalId =
-      data?.data?.id || data?.id || data?.data?.session_id || null;
+      data?.data?.reference_id ||
+      data?.reference_id ||
+      data?.data?.transaction_code ||
+      data?.transaction_code ||
+      data?.data?.id ||
+      data?.id ||
+      data?.data?.session_id ||
+      null;
 
     await supabase
       .from("payments")
@@ -718,6 +744,79 @@ Deno.serve(async (req: Request) => {
       appUser = { ...appUser, is_admin: true };
     }
 
+    if (adminMode && command === "/broadcast") {
+      await setBotState(supabase, appUser.id, {
+        step: "admin_broadcast_input",
+        draft: {},
+      });
+      await reply(
+        chatId,
+        "📣 <b>Notification utilisateurs</b>\n\nEnvoie maintenant le message à diffuser à tous les utilisateurs actifs du bot.\n\nLe bot ajoutera automatiquement: <code>Salut cher/chère {nom},</code>",
+        {
+          reply_markup: {
+            keyboard: [["❌ Annuler"]],
+            resize_keyboard: true,
+            one_time_keyboard: true,
+          },
+        },
+      );
+      return new Response("OK", { status: 200 });
+    }
+
+    if (
+      adminMode &&
+      appUser.bot_state?.step === "admin_broadcast_input" &&
+      !buttonCommand &&
+      !text.startsWith("/")
+    ) {
+      const messageToSend = text.trim();
+      if (!messageToSend) {
+        await reply(
+          chatId,
+          "❌ Message vide. Envoie un message ou clique sur Annuler.",
+        );
+        return new Response("OK", { status: 200 });
+      }
+
+      const { data: users, error } = await supabase
+        .from("app_users")
+        .select("telegram_user_id, username, is_active")
+        .eq("is_active", true);
+
+      if (error) {
+        await clearBotState(supabase, appUser.id);
+        await reply(
+          chatId,
+          `❌ Erreur récupération utilisateurs: ${error.message}`,
+          adminMenuMarkup(),
+        );
+        return new Response("OK", { status: 200 });
+      }
+
+      let sent = 0;
+      let failed = 0;
+      for (const u of users || []) {
+        const name = u.username ? `@${u.username}` : "utilisateur";
+        try {
+          await reply(
+            u.telegram_user_id,
+            `Salut cher/chère ${name},\n\n${messageToSend}`,
+          );
+          sent++;
+          await new Promise((r) => setTimeout(r, 80));
+        } catch (_e) {
+          failed++;
+        }
+      }
+      await clearBotState(supabase, appUser.id);
+      await reply(
+        chatId,
+        `✅ Notification envoyée.\nEnvoyés: <b>${sent}</b>\nÉchecs: <b>${failed}</b>`,
+        adminMenuMarkup(),
+      );
+      return new Response("OK", { status: 200 });
+    }
+
     if (adminMode && command === "/newglobalsource") {
       await setBotState(supabase, appUser.id, {
         step: "admin_global_source_input",
@@ -964,7 +1063,7 @@ Deno.serve(async (req: Request) => {
           );
           await reply(
             chatId,
-            "Après paiement, reviens ici et tape /me pour vérifier ton solde.",
+            "Après paiement, reviens ici et clique sur 🧾 Paiements pour suivre le statut. /me affichera ton solde une fois le paiement confirmé.",
             userMenuMarkup(),
           );
         }
@@ -1153,6 +1252,8 @@ Deno.serve(async (req: Request) => {
 
     if (!adminMode && command === "/me") {
       const premium = isPremium(appUser);
+      const proPlus = isProPlus(appUser);
+      const planLabel = proPlus ? "Pro Plus" : premium ? "Premium" : "Gratuit";
       const today = new Date().toISOString().slice(0, 10);
       const { data: usage } = await supabase
         .from("usage_daily")
@@ -1165,11 +1266,11 @@ Deno.serve(async (req: Request) => {
       await reply(
         chatId,
         `👤 <b>Mon compte</b>\n\n` +
-          `Plan: <b>${premium ? "Premium" : "Gratuit"}</b>\n` +
+          `Plan: <b>${planLabel}</b>\n` +
           `Analyses aujourd'hui: <b>${used}/${limit}</b>\n` +
           `Solde wallet: <b>${appUser.wallet_balance || 0} XAF</b>\n\n` +
           `${premium && appUser.plan_expires_at ? `Expire: <b>${String(appUser.plan_expires_at).slice(0, 10)}</b>\n\n` : ""}` +
-          `Pour t'abonner: <code>/subscribe</code>\nPour déposer: <code>/deposit montant</code>`,
+          `Pour t'abonner: <code>/subscribe</code>\nPour déposer: <code>/deposit montant</code>\nPaiements: <code>/payments</code>`,
         userMenuMarkup(),
       );
       return new Response("OK", { status: 200 });
@@ -1203,7 +1304,96 @@ Deno.serve(async (req: Request) => {
         );
         await reply(
           chatId,
-          "Après paiement, reviens ici et tape /me pour vérifier ton statut.",
+          "Après paiement, reviens ici et clique sur 🧾 Paiements pour suivre le statut. /me affichera ton profil une fois le paiement confirmé.",
+          userMenuMarkup(),
+        );
+      }
+      return new Response("OK", { status: 200 });
+    }
+
+    if (!adminMode && command === "/proplus") {
+      await reply(chatId, "⏳ Création du lien de paiement Pro Plus...");
+      const result = await createNelsiusCheckout(
+        supabase,
+        appUser,
+        "subscription",
+        1000,
+        "pro_plus",
+      );
+      if (result.error || !result.checkoutUrl) {
+        await reply(
+          chatId,
+          `❌ Paiement indisponible: ${result.error}`,
+          userMenuMarkup(),
+        );
+      } else {
+        await reply(
+          chatId,
+          `🚀 <b>Abonnement Pro Plus</b>\n\nPrix: <b>1000 FCFA / mois</b>\n\nInclus: traduction automatique, filtres avancés par flux, remplacement de mots/liens, suppression publicités, signatures personnalisées.`,
+          {
+            reply_markup: {
+              inline_keyboard: [
+                [{ text: "🚀 Payer 1000 FCFA", url: result.checkoutUrl }],
+              ],
+            },
+          },
+        );
+        await reply(
+          chatId,
+          "Après paiement, clique sur 🧾 Paiements pour suivre le statut.",
+          userMenuMarkup(),
+        );
+      }
+      return new Response("OK", { status: 200 });
+    }
+
+    if (!adminMode && command === "/profilters") {
+      await reply(
+        chatId,
+        `⚙️ <b>Filtres Pro Plus</b>\n\nCes commandes fonctionnent avec un abonnement Pro Plus actif.\n\nTraduction:\n<code>/translate flow_id fr on</code>\n<code>/translate flow_id en on</code>\n\nRemplacer mots:\n<code>/replace flow_id ancien => nouveau</code>\n\nLiens:\n<code>/links flow_id remove</code>\n<code>/links flow_id replace https://ton-lien.com</code>\n<code>/links flow_id keep</code>\n\nPublicités:\n<code>/blockads flow_id on</code>\n\nMots interdits/obligatoires:\n<code>/include flow_id mot1,mot2</code>\n<code>/exclude flow_id mot1,mot2</code>`,
+        userMenuMarkup(),
+      );
+      return new Response("OK", { status: 200 });
+    }
+
+    if (!adminMode && command === "/payments") {
+      const { data: payments, error } = await supabase
+        .from("payments")
+        .select(
+          "reference, amount, currency, status, payment_type, paid_at, created_at",
+        )
+        .eq("user_id", appUser.id)
+        .order("created_at", { ascending: false })
+        .limit(10);
+
+      if (error)
+        await reply(chatId, `❌ Erreur: ${error.message}`, userMenuMarkup());
+      else if (!payments?.length)
+        await reply(
+          chatId,
+          "📭 Aucun paiement pour le moment.",
+          userMenuMarkup(),
+        );
+      else {
+        const statusIcon: Record<string, string> = {
+          created: "🕐",
+          pending: "⏳",
+          paid: "✅",
+          success: "✅",
+          completed: "✅",
+          failed: "❌",
+          cancelled: "🚫",
+          canceled: "🚫",
+        };
+        const lines = payments.map((p: any) => {
+          const date = new Date(p.created_at).toLocaleString("fr-FR");
+          const type = p.payment_type === "deposit" ? "Dépôt" : "Premium";
+          const icon = statusIcon[String(p.status || "").toLowerCase()] || "ℹ️";
+          return `${icon} <b>${type}</b> — ${p.amount} ${p.currency}\nStatut: <b>${p.status}</b>\nRéf: <code>${p.reference}</code>\n${p.paid_at ? `Payé: ${new Date(p.paid_at).toLocaleString("fr-FR")}` : `Créé: ${date}`}`;
+        });
+        await reply(
+          chatId,
+          `🧾 <b>Mes paiements récents</b>\n\n${lines.join("\n\n")}`,
           userMenuMarkup(),
         );
       }
@@ -1263,7 +1453,7 @@ Deno.serve(async (req: Request) => {
         );
         await reply(
           chatId,
-          "Après paiement, reviens ici et tape /me pour vérifier ton solde.",
+          "Après paiement, reviens ici et clique sur 🧾 Paiements pour suivre le statut. /me affichera ton solde une fois le paiement confirmé.",
           userMenuMarkup(),
         );
       }
@@ -1628,8 +1818,20 @@ Deno.serve(async (req: Request) => {
         "/allowalbums",
         "/rewriteai",
         "/signature",
+        "/translate",
+        "/replace",
+        "/links",
       ].includes(command)
     ) {
+      if (!isProPlus(appUser)) {
+        await reply(
+          chatId,
+          "🔒 Ces filtres avancés sont réservés au plan Pro Plus. Clique sur 🚀 Pro Plus pour l’activer.",
+          userMenuMarkup(),
+        );
+        return new Response("OK", { status: 200 });
+      }
+
       const flow = await findOwnedRecord(
         supabase,
         "flows",
@@ -1670,6 +1872,37 @@ Deno.serve(async (req: Request) => {
         patch = {
           signature_text: args.slice(1).join(" ").trim().substring(0, 200),
         };
+      if (command === "/translate") {
+        const lang = (args[1] || "fr").toLowerCase();
+        const enabled = parseOnOff(args[2] || "on");
+        patch = { target_language: lang, translate_enabled: enabled !== false };
+      }
+      if (command === "/replace") {
+        const raw = args.slice(1).join(" ");
+        const [from, to] = raw.split("=>").map((s) => s.trim());
+        if (!from || !to) {
+          await reply(chatId, "⚠️ Usage: /replace flow_id ancien => nouveau");
+          return new Response("OK", { status: 200 });
+        }
+        const current = mergeFilters(flow.filters, {});
+        patch = {
+          replacements: { ...(current.replacements || {}), [from]: to },
+        };
+      }
+      if (command === "/links") {
+        const action = (args[1] || "keep").toLowerCase();
+        if (!["keep", "remove", "replace"].includes(action)) {
+          await reply(
+            chatId,
+            "⚠️ Usage: /links flow_id keep|remove|replace [url]",
+          );
+          return new Response("OK", { status: 200 });
+        }
+        patch = {
+          link_action: action,
+          link_replacement: action === "replace" ? args[2] || "" : "",
+        };
+      }
 
       const filters = mergeFilters(flow.filters, patch);
       const { error } = await supabase

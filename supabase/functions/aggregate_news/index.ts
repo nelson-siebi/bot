@@ -5,6 +5,8 @@ declare const Deno: any;
 const BOT_TOKEN = Deno.env.get("TELEGRAM_BOT_TOKEN") || "";
 const OUTPUT_CHAT_ID = Deno.env.get("TELEGRAM_CHAT_ID") || "";
 const GEMINI_API_KEY = Deno.env.get("GEMINI_API_KEY") || "";
+const FREE_USER_SIGNATURE =
+  Deno.env.get("FREE_USER_SIGNATURE") || "🤖 Propulsé par IzyNews";
 
 // Storj S3-compatible configuration
 const STORJ_ACCESS_KEY = Deno.env.get("STORJ_ACCESS_KEY") || "";
@@ -416,6 +418,38 @@ async function restructureWithAI(
     console.error("[Gemini] Error:", e);
   }
   return { title: "", content: rawText, isAd: false };
+}
+
+async function translateWithAI(
+  rawText: string,
+  targetLanguage: string,
+): Promise<string> {
+  if (!GEMINI_API_KEY || rawText.length < 3) return rawText;
+  try {
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [
+            {
+              parts: [
+                {
+                  text: `Traduis le message suivant en ${targetLanguage}. Conserve le sens, les noms propres, les emojis pertinents et les liens si présents. Réponds uniquement avec le texte traduit.\n\n${rawText}`,
+                },
+              ],
+            },
+          ],
+        }),
+      },
+    );
+    const data = await res.json();
+    return data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || rawText;
+  } catch (e) {
+    console.error("[Gemini] Translation error:", e);
+    return rawText;
+  }
 }
 
 // ── Upload to Storj (S3 REST + SigV4) + presigned GET URL for Telegram ──
@@ -926,7 +960,7 @@ async function uploadVideoDirect(
 const DEFAULT_FLOW_FILTERS = {
   include_keywords: [],
   exclude_keywords: [],
-  block_ads: true,
+  block_ads: false,
   media_only: false,
   allow_text: true,
   allow_photos: true,
@@ -936,12 +970,25 @@ const DEFAULT_FLOW_FILTERS = {
   remove_links: false,
   remove_mentions: false,
   signature_text: "",
+  translate_enabled: false,
+  target_language: "fr",
+  replacements: {},
+  link_action: "keep",
+  link_replacement: "",
 };
 
-function isPremiumUser(user: any): boolean {
-  if (!user || user.plan !== "premium") return false;
+function isPlanActive(user: any, planNames: string[]): boolean {
+  if (!user || !planNames.includes(user.plan)) return false;
   if (!user.plan_expires_at) return true;
   return new Date(user.plan_expires_at).getTime() > Date.now();
+}
+
+function isPremiumUser(user: any): boolean {
+  return isPlanActive(user, ["premium", "pro_plus"]);
+}
+
+function isProPlusUser(user: any): boolean {
+  return isPlanActive(user, ["pro_plus"]);
 }
 
 function normalizeFilters(filters: any) {
@@ -984,12 +1031,38 @@ function skipReasonForFilters(
   return null;
 }
 
-function transformContent(text: string, filters: any): string {
+function transformContent(
+  text: string,
+  filters: any,
+  proPlus: boolean,
+  paidUser: boolean,
+): string {
   let out = text.trim();
-  if (filters.remove_links) out = out.replace(/https?:\/\/\S+/gi, "").trim();
-  if (filters.remove_mentions) out = out.replace(/@\w+/g, "").trim();
-  if (filters.signature_text)
-    out = `${out}\n\n${String(filters.signature_text).trim()}`.trim();
+
+  if (proPlus) {
+    const replacements = filters.replacements || {};
+    for (const [from, to] of Object.entries(replacements)) {
+      if (!from) continue;
+      out = out.replace(
+        new RegExp(String(from).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi"),
+        String(to),
+      );
+    }
+
+    if (filters.link_action === "remove" || filters.remove_links) {
+      out = out.replace(/https?:\/\/\S+/gi, "").trim();
+    } else if (filters.link_action === "replace" && filters.link_replacement) {
+      out = out
+        .replace(/https?:\/\/\S+/gi, String(filters.link_replacement))
+        .trim();
+    }
+
+    if (filters.remove_mentions) out = out.replace(/@\w+/g, "").trim();
+    if (filters.signature_text)
+      out = `${out}\n\n${String(filters.signature_text).trim()}`.trim();
+  }
+
+  if (!paidUser) out = `${out}\n\n${FREE_USER_SIGNATURE}`.trim();
   return out;
 }
 
@@ -1052,6 +1125,7 @@ Deno.serve(async (_req: Request) => {
     let processedCount = 0;
     let publishedCount = 0;
     let skippedCount = 0;
+    const warnedUserIds = new Set<string>();
 
     for (const flow of flows) {
       const user = flow.user;
@@ -1064,6 +1138,27 @@ Deno.serve(async (_req: Request) => {
       if (source.type !== "telegram") continue;
 
       const premium = isPremiumUser(user);
+      const proPlus = isProPlusUser(user);
+
+      if (premium && user.plan_expires_at && !warnedUserIds.has(user.id)) {
+        const expiresAt = new Date(user.plan_expires_at).getTime();
+        const daysLeft = Math.ceil((expiresAt - Date.now()) / 86400000);
+        const lastWarn = user.last_subscription_warning_at
+          ? new Date(user.last_subscription_warning_at).getTime()
+          : 0;
+        if (daysLeft > 0 && daysLeft <= 5 && Date.now() - lastWarn > 86400000) {
+          await sendTextToTelegram(
+            `⏰ Salut ${user.username ? "@" + user.username : "cher utilisateur"},\n\nTon abonnement <b>${user.plan === "pro_plus" ? "Pro Plus" : "Premium"}</b> expire dans <b>${daysLeft} jour(s)</b>. Pense à renouveler pour garder tes fonctionnalités actives.`,
+            String(user.telegram_user_id),
+          );
+          await supabase
+            .from("app_users")
+            .update({ last_subscription_warning_at: new Date().toISOString() })
+            .eq("id", user.id);
+          warnedUserIds.add(user.id);
+        }
+      }
+
       const channel = source.config?.channel;
       const targetChatId = target.chat_id;
       const lastMsgId = Number(flow.last_message_id || 0);
@@ -1122,7 +1217,7 @@ Deno.serve(async (_req: Request) => {
 
           if (alreadyProcessed) continue;
 
-          const reason = skipReasonForFilters(msg, filters);
+          const reason = proPlus ? skipReasonForFilters(msg, filters) : null;
           if (reason) {
             skippedCount++;
             await recordActivity(supabase, {
@@ -1142,7 +1237,7 @@ Deno.serve(async (_req: Request) => {
           }
 
           let finalContent = msg.text;
-          if (filters.use_ai_rewrite && msg.text.length >= 10) {
+          if (proPlus && filters.use_ai_rewrite && msg.text.length >= 10) {
             const aiRes = await restructureWithAI(msg.text);
             if (aiRes.isAd) {
               skippedCount++;
@@ -1164,8 +1259,16 @@ Deno.serve(async (_req: Request) => {
             finalContent = aiRes.content.trim();
           }
 
+          if (proPlus && filters.translate_enabled) {
+            finalContent = await translateWithAI(
+              finalContent,
+              filters.target_language || "fr",
+            );
+          }
+
           const textToPublish =
-            transformContent(finalContent, filters) || originalUrl;
+            transformContent(finalContent, filters, proPlus, premium) ||
+            originalUrl;
           const isShortVideo =
             msg.videoUrl && (!msg.videoDuration || msg.videoDuration <= 60);
           let telegramMsgId: number | null = null;

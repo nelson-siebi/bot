@@ -3,13 +3,23 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 declare const Deno: any;
 
 function isPaidStatus(status: string): boolean {
-  return ["paid", "success", "successful", "completed", "approved", "succeeded"].includes(status.toLowerCase());
+  return [
+    "paid",
+    "success",
+    "successful",
+    "completed",
+    "approved",
+    "succeeded",
+  ].includes(status.toLowerCase());
 }
 
 function extractPayloadValue(payload: any, keys: string[]): string | null {
   for (const key of keys) {
-    const value = key.split(".").reduce((acc: any, part: string) => acc?.[part], payload);
-    if (value !== undefined && value !== null && String(value).trim()) return String(value);
+    const value = key
+      .split(".")
+      .reduce((acc: any, part: string) => acc?.[part], payload);
+    if (value !== undefined && value !== null && String(value).trim())
+      return String(value);
   }
   return null;
 }
@@ -21,9 +31,15 @@ Deno.serve(async (req: Request) => {
 
   const webhookSecret = Deno.env.get("NELSIUS_WEBHOOK_SECRET") || "";
   if (webhookSecret) {
-    const incomingSecret = req.headers.get("x-nelsius-secret") || req.headers.get("x-webhook-secret") || "";
+    const incomingSecret =
+      req.headers.get("x-nelsius-secret") ||
+      req.headers.get("x-webhook-secret") ||
+      "";
     if (incomingSecret !== webhookSecret) {
-      return new Response(JSON.stringify({ success: false, error: "Unauthorized webhook" }), { status: 401 });
+      return new Response(
+        JSON.stringify({ success: false, error: "Unauthorized webhook" }),
+        { status: 401 },
+      );
     }
   }
 
@@ -36,30 +52,90 @@ Deno.serve(async (req: Request) => {
   try {
     payload = await req.json();
   } catch (_e) {
-    return new Response(JSON.stringify({ success: false, error: "Invalid JSON" }), { status: 400 });
+    return new Response(
+      JSON.stringify({ success: false, error: "Invalid JSON" }),
+      { status: 400 },
+    );
   }
 
-  const reference = extractPayloadValue(payload, ["reference", "data.reference", "payment.reference", "transaction.reference"]);
-  const status = extractPayloadValue(payload, ["status", "data.status", "payment.status", "transaction.status"]) || "unknown";
-  const externalId = extractPayloadValue(payload, ["id", "data.id", "charge_id", "session_id", "data.charge_id", "data.session_id"]);
+  const reference = extractPayloadValue(payload, [
+    "reference",
+    "reference_id",
+    "data.reference",
+    "data.reference_id",
+    "payment.reference",
+    "payment.reference_id",
+    "transaction.reference",
+    "transaction.reference_id",
+  ]);
+  const status =
+    extractPayloadValue(payload, [
+      "status",
+      "data.status",
+      "payment.status",
+      "transaction.status",
+    ]) || "unknown";
+  const externalId = extractPayloadValue(payload, [
+    "id",
+    "data.id",
+    "transaction_code",
+    "data.transaction_code",
+    "charge_id",
+    "session_id",
+    "data.charge_id",
+    "data.session_id",
+    "data.operator_transaction_id",
+  ]);
 
   if (!reference) {
-    return new Response(JSON.stringify({ success: false, error: "Missing reference" }), { status: 400 });
+    return new Response(
+      JSON.stringify({ success: false, error: "Missing reference" }),
+      { status: 400 },
+    );
   }
 
-  const { data: payment, error: paymentError } = await supabase
+  let { data: payment, error: paymentError } = await supabase
     .from("payments")
     .select("*")
     .eq("reference", reference)
     .maybeSingle();
 
+  if (!payment && reference) {
+    const fallback = await supabase
+      .from("payments")
+      .select("*")
+      .eq("external_id", reference)
+      .maybeSingle();
+    payment = fallback.data;
+    paymentError = fallback.error;
+  }
+
+  if (!payment && externalId) {
+    const fallback = await supabase
+      .from("payments")
+      .select("*")
+      .eq("external_id", externalId)
+      .maybeSingle();
+    payment = fallback.data;
+    paymentError = fallback.error;
+  }
+
   if (paymentError) {
-    return new Response(JSON.stringify({ success: false, error: paymentError.message }), { status: 500 });
+    return new Response(
+      JSON.stringify({ success: false, error: paymentError.message }),
+      { status: 500 },
+    );
   }
 
   if (!payment) {
-    return new Response(JSON.stringify({ success: false, error: "Payment not found" }), { status: 404 });
+    return new Response(
+      JSON.stringify({ success: false, error: "Payment not found" }),
+      { status: 404 },
+    );
   }
+
+  const incomingPaid = isPaidStatus(status);
+  const wasAlreadyPaid = isPaidStatus(String(payment.status || ""));
 
   const updatePayload: Record<string, unknown> = {
     status,
@@ -67,7 +143,8 @@ Deno.serve(async (req: Request) => {
     external_id: externalId,
   };
 
-  if (isPaidStatus(status)) updatePayload.paid_at = new Date().toISOString();
+  if (incomingPaid && !payment.paid_at)
+    updatePayload.paid_at = new Date().toISOString();
 
   const { error: updateError } = await supabase
     .from("payments")
@@ -75,27 +152,43 @@ Deno.serve(async (req: Request) => {
     .eq("id", payment.id);
 
   if (updateError) {
-    return new Response(JSON.stringify({ success: false, error: updateError.message }), { status: 500 });
+    return new Response(
+      JSON.stringify({ success: false, error: updateError.message }),
+      { status: 500 },
+    );
   }
 
-  if (!isPaidStatus(status) || payment.status === "paid" || payment.status === "success" || payment.status === "completed") {
-    return new Response(JSON.stringify({ success: true, message: "Payment status recorded" }));
+  if (!incomingPaid || wasAlreadyPaid) {
+    return new Response(
+      JSON.stringify({
+        success: true,
+        message: wasAlreadyPaid
+          ? "Payment already processed"
+          : "Payment status recorded",
+      }),
+    );
   }
 
   if (payment.payment_type === "subscription") {
     const now = new Date();
     const end = new Date(now);
     end.setMonth(end.getMonth() + 1);
+    const requestedPlan =
+      payment.metadata?.plan === "pro_plus" ? "pro_plus" : "premium";
 
     await supabase
       .from("app_users")
-      .update({ plan: "premium", plan_expires_at: end.toISOString(), is_active: true })
+      .update({
+        plan: requestedPlan,
+        plan_expires_at: end.toISOString(),
+        is_active: true,
+      })
       .eq("id", payment.user_id);
 
     await supabase.from("subscriptions").insert({
       user_id: payment.user_id,
       provider: "nelsius",
-      status: "active",
+      status: requestedPlan,
       start_at: now.toISOString(),
       end_at: end.toISOString(),
       payment_reference: reference,
@@ -109,7 +202,8 @@ Deno.serve(async (req: Request) => {
       .eq("id", payment.user_id)
       .maybeSingle();
 
-    const balanceAfter = (user?.wallet_balance || 0) + Number(payment.amount || 0);
+    const balanceAfter =
+      (user?.wallet_balance || 0) + Number(payment.amount || 0);
 
     await supabase
       .from("app_users")
