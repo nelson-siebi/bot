@@ -71,6 +71,7 @@ function userMenuMarkup() {
     reply_markup: {
       keyboard: [
         ["➕ Nouveau flux", "🔁 Mes flux"],
+        ["⏸ Désactiver flux", "▶️ Réactiver flux"],
         ["📡 Mes sources", "🎯 Mes cibles"],
         ["📊 Activité", "👤 Mon compte"],
         ["💳 Premium", "❓ Aide"],
@@ -108,10 +109,27 @@ function targetChoiceMarkup(targets: any[]) {
   };
 }
 
+function flowChoiceMarkup(flows: any[]) {
+  const keyboard = flows
+    .slice(0, 20)
+    .map((f) => [
+      `🔁 ${shortId(f.id)} - @${f.source?.config?.channel || "source"} → ${f.target?.chat_id || "cible"}`.substring(
+        0,
+        90,
+      ),
+    ]);
+  keyboard.push(["❌ Annuler"]);
+  return {
+    reply_markup: { keyboard, resize_keyboard: true, one_time_keyboard: true },
+  };
+}
+
 function commandFromButton(label: string): string | null {
   const map: Record<string, string> = {
     "➕ Nouveau flux": "/newflow",
     "🔁 Mes flux": "/flows",
+    "⏸ Désactiver flux": "/choosepauseflow",
+    "▶️ Réactiver flux": "/chooseresumeflow",
     "📡 Mes sources": "/sources",
     "🎯 Mes cibles": "/targets",
     "📊 Activité": "/activity",
@@ -335,7 +353,23 @@ async function getBotInfo(): Promise<{ id: number; username: string } | null> {
 }
 
 function botAdminUrl(username: string): string {
-  return `https://t.me/${username}?startchannel=setup&admin=post_messages+edit_messages+delete_messages`;
+  const allAdminRights = [
+    "change_info",
+    "post_messages",
+    "edit_messages",
+    "delete_messages",
+    "invite_users",
+    "restrict_members",
+    "pin_messages",
+    "promote_members",
+    "manage_video_chats",
+    "manage_chat",
+    "manage_topics",
+    "post_stories",
+    "edit_stories",
+    "delete_stories",
+  ].join("+");
+  return `https://t.me/${username}?startchannel=setup&admin=${allAdminRights}`;
 }
 
 async function checkBotAdminInChat(
@@ -673,6 +707,46 @@ Deno.serve(async (req: Request) => {
       return new Response("OK", { status: 200 });
     }
 
+    if (
+      !adminMode &&
+      ["/choosepauseflow", "/chooseresumeflow"].includes(command)
+    ) {
+      const shouldPause = command === "/choosepauseflow";
+      const { data: flows, error } = await supabase
+        .from("flows")
+        .select(
+          "id, is_active, source:user_sources(config), target:user_targets(chat_id,title)",
+        )
+        .eq("user_id", appUser.id)
+        .eq("is_active", shouldPause)
+        .order("created_at", { ascending: false });
+
+      if (error)
+        await reply(chatId, `❌ Erreur: ${error.message}`, userMenuMarkup());
+      else if (!flows?.length) {
+        await reply(
+          chatId,
+          shouldPause
+            ? "📭 Tu n'as aucun flux actif à désactiver."
+            : "📭 Tu n'as aucun flux désactivé à réactiver.",
+          userMenuMarkup(),
+        );
+      } else {
+        await setBotState(supabase, appUser.id, {
+          step: shouldPause ? "choose_flow_pause" : "choose_flow_resume",
+          draft: {},
+        });
+        await reply(
+          chatId,
+          shouldPause
+            ? "⏸ Choisis le flux à désactiver."
+            : "▶️ Choisis le flux à réactiver.",
+          flowChoiceMarkup(flows),
+        );
+      }
+      return new Response("OK", { status: 200 });
+    }
+
     if (!adminMode && command === "/newflow") {
       await setBotState(supabase, appUser.id, {
         step: "new_flow_source",
@@ -756,6 +830,38 @@ Deno.serve(async (req: Request) => {
     ) {
       const state = appUser.bot_state || {};
       const draft = state.draft || {};
+
+      if (["choose_flow_pause", "choose_flow_resume"].includes(state.step)) {
+        const idMatch = text.match(/[0-9a-f]{8}/i);
+        const flow = idMatch
+          ? await findOwnedRecord(supabase, "flows", appUser.id, idMatch[0])
+          : null;
+        if (!flow) {
+          await reply(
+            chatId,
+            "❌ Flux non reconnu. Choisis un bouton flux ou clique sur Annuler.",
+          );
+          return new Response("OK", { status: 200 });
+        }
+        const active = state.step === "choose_flow_resume";
+        const { error } = await supabase
+          .from("flows")
+          .update({ is_active: active })
+          .eq("id", flow.id)
+          .eq("user_id", appUser.id);
+        await clearBotState(supabase, appUser.id);
+        if (error)
+          await reply(chatId, `❌ Erreur: ${error.message}`, userMenuMarkup());
+        else
+          await reply(
+            chatId,
+            active
+              ? `▶️ Flux réactivé: <code>${shortId(flow.id)}</code>`
+              : `⏸ Flux désactivé: <code>${shortId(flow.id)}</code>`,
+            userMenuMarkup(),
+          );
+        return new Response("OK", { status: 200 });
+      }
 
       if (state.step === "new_flow_source") {
         const { data: source, error } = await getOrCreateUserSource(
