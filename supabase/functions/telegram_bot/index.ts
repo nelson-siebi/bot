@@ -64,7 +64,73 @@ const DEFAULT_FLOW_FILTERS = {
   signature_text: "",
 };
 
-const USER_HELP = `🤖 <b>Bot Telegram Auto — Espace utilisateur</b>\n\n<b>📡 Sources</b>\n/addsource &lt;@canal ou URL t.me&gt; — Ajouter un canal source\n/sources — Mes sources\n/delsource &lt;id&gt; — Désactiver une source\n\n<b>🎯 Canaux cibles</b>\n/addtarget &lt;@canal ou -100...&gt; [nom] — Ajouter un canal cible\n/targets — Mes canaux cibles\n/deltarget &lt;id&gt; — Désactiver un canal cible\n\n<b>🔁 Flux</b>\n/addflow &lt;source_id&gt; &lt;target_id&gt; — Relier source → cible\n/flows — Mes flux\n/pauseflow &lt;id&gt; — Mettre en pause\n/resumeflow &lt;id&gt; — Reprendre\n/deleteflow &lt;id&gt; — Supprimer/désactiver\n\n<b>🧰 Filtres</b>\n/filters &lt;flow_id&gt; — Voir les filtres\n/include &lt;flow_id&gt; mot1,mot2 — Mots obligatoires\n/exclude &lt;flow_id&gt; mot1,mot2 — Mots interdits\n/blockads &lt;flow_id&gt; on|off — Bloquer les pubs\n/mediaonly &lt;flow_id&gt; on|off — Publier seulement les médias\n/allowalbums &lt;flow_id&gt; on|off — Autoriser les albums\n/rewriteai &lt;flow_id&gt; on|off — Reformulation IA\n/signature &lt;flow_id&gt; texte — Signature ajoutée\n\n<b>📊 Activité</b>\n/activity — Dernières actions\n/me — Mon compte\n/subscribe — Abonnement Premium`;
+const USER_HELP = `🤖 <b>Bot Telegram Auto — Espace utilisateur</b>\n\nUtilise les boutons en bas pour gérer ton automatisation Telegram.\n\n<b>Scénario rapide</b>\n1. Clique sur <b>➕ Nouveau flux</b>\n2. Envoie le canal source\n3. Choisis ou ajoute le canal cible\n4. Le bot crée automatiquement le flux\n\n<b>Commandes disponibles</b>\n/addsource &lt;@canal&gt; — Ajouter une source\n/addtarget &lt;@canal ou -100...&gt; — Ajouter une cible\n/addflow &lt;source_id&gt; &lt;target_id&gt; — Créer un flux\n/flows — Mes flux\n/activity — Activité\n/subscribe — Premium`;
+
+function userMenuMarkup() {
+  return {
+    reply_markup: {
+      keyboard: [
+        ["➕ Nouveau flux", "🔁 Mes flux"],
+        ["📡 Mes sources", "🎯 Mes cibles"],
+        ["📊 Activité", "👤 Mon compte"],
+        ["💳 Premium", "❓ Aide"],
+      ],
+      resize_keyboard: true,
+      one_time_keyboard: false,
+    },
+  };
+}
+
+function adminMenuMarkup() {
+  return {
+    reply_markup: {
+      keyboard: [
+        ["▶️ Lancer agrégation", "📊 Stats"],
+        ["➕ Source globale", "📡 Sources globales"],
+        ["📰 Articles", "🧹 Nettoyage"],
+        ["❓ Aide admin"],
+      ],
+      resize_keyboard: true,
+      one_time_keyboard: false,
+    },
+  };
+}
+
+function targetChoiceMarkup(targets: any[]) {
+  const keyboard = targets
+    .slice(0, 20)
+    .map((t) => [
+      `🎯 ${shortId(t.id)} - ${(t.title || t.chat_id || "Canal").substring(0, 35)}`,
+    ]);
+  keyboard.push(["➕ Ajouter une cible", "❌ Annuler"]);
+  return {
+    reply_markup: { keyboard, resize_keyboard: true, one_time_keyboard: true },
+  };
+}
+
+function commandFromButton(label: string): string | null {
+  const map: Record<string, string> = {
+    "➕ Nouveau flux": "/newflow",
+    "🔁 Mes flux": "/flows",
+    "📡 Mes sources": "/sources",
+    "🎯 Mes cibles": "/targets",
+    "📊 Activité": "/activity",
+    "👤 Mon compte": "/me",
+    "💳 Premium": "/subscribe",
+    "❓ Aide": "/help",
+    "▶️ Lancer agrégation": "/run",
+    "📊 Stats": "/stats",
+    "➕ Source globale": "/newglobalsource",
+    "📡 Sources globales": "/sources",
+    "📰 Articles": "/list",
+    "🧹 Nettoyage": "/adminclean",
+    "🗑 DB seulement": "/deleteall",
+    "🔥 Tout supprimer": "/clearall",
+    "❓ Aide admin": "/help",
+    "❌ Annuler": "/cancel",
+  };
+  return map[label] || null;
+}
 
 function shortId(id: string): string {
   return String(id || "").substring(0, 8);
@@ -123,6 +189,135 @@ async function findOwnedRecord(
     .limit(1)
     .maybeSingle();
   return data || null;
+}
+
+async function setBotState(
+  supabase: any,
+  userId: string,
+  state: Record<string, unknown>,
+) {
+  await supabase
+    .from("app_users")
+    .update({ bot_state: state })
+    .eq("id", userId);
+}
+
+async function clearBotState(supabase: any, userId: string) {
+  await setBotState(supabase, userId, {});
+}
+
+async function getOrCreateUserSource(
+  supabase: any,
+  userId: string,
+  rawChannel: string,
+) {
+  const channel = normalizeTelegramChannel(rawChannel);
+  if (!channel) return { data: null, error: "Canal source invalide." };
+  const { data: existing } = await supabase
+    .from("user_sources")
+    .select("*")
+    .eq("user_id", userId)
+    .eq("type", "telegram")
+    .eq("config->>channel", channel)
+    .maybeSingle();
+  if (existing) {
+    if (!existing.is_active)
+      await supabase
+        .from("user_sources")
+        .update({ is_active: true })
+        .eq("id", existing.id);
+    return { data: { ...existing, is_active: true }, error: null };
+  }
+  const { data, error } = await supabase
+    .from("user_sources")
+    .insert({
+      user_id: userId,
+      type: "telegram",
+      config: { channel },
+      is_active: true,
+    })
+    .select("*")
+    .maybeSingle();
+  return { data, error: error?.message || null };
+}
+
+async function getOrCreateUserTarget(
+  supabase: any,
+  userId: string,
+  rawTarget: string,
+  title?: string,
+) {
+  const chatId = normalizeTargetChat(rawTarget);
+  if (!chatId) return { data: null, error: "Canal cible invalide." };
+  const targetTitle = title || chatId;
+  const { data: existing } = await supabase
+    .from("user_targets")
+    .select("*")
+    .eq("user_id", userId)
+    .eq("chat_id", chatId)
+    .maybeSingle();
+  if (existing) {
+    if (!existing.is_active)
+      await supabase
+        .from("user_targets")
+        .update({ is_active: true, title: targetTitle })
+        .eq("id", existing.id);
+    return {
+      data: {
+        ...existing,
+        is_active: true,
+        title: existing.title || targetTitle,
+      },
+      error: null,
+    };
+  }
+  const { data, error } = await supabase
+    .from("user_targets")
+    .insert({
+      user_id: userId,
+      chat_id: chatId,
+      title: targetTitle,
+      is_active: true,
+    })
+    .select("*")
+    .maybeSingle();
+  return { data, error: error?.message || null };
+}
+
+async function createFlowForUser(
+  supabase: any,
+  appUser: any,
+  sourceId: string,
+  targetId: string,
+) {
+  const premium = isPremium(appUser);
+  if (!premium) {
+    const { count } = await supabase
+      .from("flows")
+      .select("*", { count: "exact", head: true })
+      .eq("user_id", appUser.id)
+      .eq("is_active", true);
+    if ((count || 0) >= 1)
+      return {
+        data: null,
+        error:
+          "Le plan gratuit autorise 1 seul flux actif. Passe Premium pour en créer plusieurs.",
+      };
+  }
+  const { data, error } = await supabase
+    .from("flows")
+    .insert({
+      user_id: appUser.id,
+      source_id: sourceId,
+      target_id: targetId,
+      mode: "new_only",
+      initial_last_n: 5,
+      is_active: true,
+      filters: DEFAULT_FLOW_FILTERS,
+    })
+    .select("id")
+    .maybeSingle();
+  return { data, error: error?.message || null };
 }
 
 async function reply(
@@ -287,17 +482,280 @@ Deno.serve(async (req: Request) => {
     Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "",
   );
 
-  const parts = text.split(/\s+/);
+  const adminMode = isAdmin(chatId) || isAdmin(userId);
+  const buttonCommand = commandFromButton(text);
+  const normalizedText = buttonCommand || text;
+  const parts = normalizedText.split(/\s+/);
   const command = parts[0]?.toLowerCase() || "";
   const args = parts.slice(1);
 
-  const adminMode = isAdmin(chatId) || isAdmin(userId);
-
   try {
-    // ── Ensure app user exists for non-admins ─────────────────────────────
-    let appUser: any = null;
-    if (!adminMode) {
-      appUser = await getOrCreateAppUser(supabase, userId, username);
+    // ── Ensure app user exists for every Telegram user, including admins ──
+    let appUser: any = await getOrCreateAppUser(supabase, userId, username);
+    if (adminMode && !appUser.is_admin) {
+      await supabase
+        .from("app_users")
+        .update({ is_admin: true })
+        .eq("id", appUser.id);
+      appUser = { ...appUser, is_admin: true };
+    }
+
+    if (adminMode && command === "/newglobalsource") {
+      await setBotState(supabase, appUser.id, {
+        step: "admin_global_source_input",
+        draft: {},
+      });
+      await reply(
+        chatId,
+        "➕ <b>Nouvelle source globale</b>\n\nEnvoie le canal Telegram source à ajouter au système global.\n\nExemple: <code>@canal_source</code> ou <code>https://t.me/canal_source</code>",
+        {
+          reply_markup: {
+            keyboard: [["❌ Annuler"]],
+            resize_keyboard: true,
+            one_time_keyboard: true,
+          },
+        },
+      );
+      return new Response("OK", { status: 200 });
+    }
+
+    if (
+      adminMode &&
+      appUser.bot_state?.step === "admin_global_source_input" &&
+      !buttonCommand &&
+      !text.startsWith("/")
+    ) {
+      const channel = normalizeTelegramChannel(text);
+      if (!channel) {
+        await reply(
+          chatId,
+          "❌ Canal invalide. Envoie un @canal ou une URL t.me, ou clique sur Annuler.",
+        );
+        return new Response("OK", { status: 200 });
+      }
+
+      const { error } = await supabase.from("sources").insert({
+        name: `@${channel}`,
+        type: "telegram",
+        config: { channel },
+        is_active: true,
+      });
+      await clearBotState(supabase, appUser.id);
+      if (error)
+        await reply(chatId, `❌ Erreur: ${error.message}`, adminMenuMarkup());
+      else
+        await reply(
+          chatId,
+          `✅ Source globale ajoutée: <b>@${channel}</b>`,
+          adminMenuMarkup(),
+        );
+      return new Response("OK", { status: 200 });
+    }
+
+    if (adminMode && command === "/adminclean") {
+      await reply(
+        chatId,
+        "🧹 <b>Nettoyage admin</b>\n\nChoisis l'action à exécuter. Attention, ces actions sont sensibles.",
+        {
+          reply_markup: {
+            keyboard: [
+              ["🗑 DB seulement", "🔥 Tout supprimer"],
+              ["❌ Annuler"],
+            ],
+            resize_keyboard: true,
+            one_time_keyboard: true,
+          },
+        },
+      );
+      return new Response("OK", { status: 200 });
+    }
+
+    if (command === "/cancel") {
+      await clearBotState(supabase, appUser.id);
+      await reply(
+        chatId,
+        "✅ Action annulée.",
+        adminMode ? adminMenuMarkup() : userMenuMarkup(),
+      );
+      return new Response("OK", { status: 200 });
+    }
+
+    if (!adminMode && command === "/newflow") {
+      await setBotState(supabase, appUser.id, {
+        step: "new_flow_source",
+        draft: {},
+      });
+      await reply(
+        chatId,
+        "➕ <b>Nouveau flux</b>\n\nEnvoie maintenant le canal source à surveiller.\n\nExemple: <code>@canal_source</code> ou <code>https://t.me/canal_source</code>",
+        {
+          reply_markup: {
+            keyboard: [["❌ Annuler"]],
+            resize_keyboard: true,
+            one_time_keyboard: true,
+          },
+        },
+      );
+      return new Response("OK", { status: 200 });
+    }
+
+    if (
+      !adminMode &&
+      appUser.bot_state?.step &&
+      !buttonCommand &&
+      !text.startsWith("/")
+    ) {
+      const state = appUser.bot_state || {};
+      const draft = state.draft || {};
+
+      if (state.step === "new_flow_source") {
+        const { data: source, error } = await getOrCreateUserSource(
+          supabase,
+          appUser.id,
+          text,
+        );
+        if (error || !source) {
+          await reply(
+            chatId,
+            `❌ ${error || "Impossible d'ajouter la source."}\n\nRenvoie un canal source valide ou clique sur Annuler.`,
+          );
+          return new Response("OK", { status: 200 });
+        }
+
+        const { data: targets } = await supabase
+          .from("user_targets")
+          .select("id, chat_id, title, is_active")
+          .eq("user_id", appUser.id)
+          .eq("is_active", true)
+          .order("created_at", { ascending: false });
+
+        if (!targets?.length) {
+          await setBotState(supabase, appUser.id, {
+            step: "new_flow_target_input",
+            draft: { source_id: source.id },
+          });
+          await reply(
+            chatId,
+            `✅ Source enregistrée: <b>@${source.config?.channel}</b>\n\nMaintenant, envoie le canal cible où republier.\n\nExemple: <code>@mon_canal</code> ou <code>-100...</code>\n\n⚠️ Ajoute le bot comme admin du canal cible.`,
+            {
+              reply_markup: {
+                keyboard: [["❌ Annuler"]],
+                resize_keyboard: true,
+                one_time_keyboard: true,
+              },
+            },
+          );
+        } else {
+          await setBotState(supabase, appUser.id, {
+            step: "new_flow_choose_target",
+            draft: { source_id: source.id },
+          });
+          await reply(
+            chatId,
+            `✅ Source enregistrée: <b>@${source.config?.channel}</b>\n\nChoisis maintenant le canal cible dans les boutons ci-dessous ou ajoute une nouvelle cible.`,
+            targetChoiceMarkup(targets),
+          );
+        }
+        return new Response("OK", { status: 200 });
+      }
+
+      if (state.step === "new_flow_choose_target") {
+        if (text === "➕ Ajouter une cible") {
+          await setBotState(supabase, appUser.id, {
+            step: "new_flow_target_input",
+            draft,
+          });
+          await reply(
+            chatId,
+            "🎯 Envoie le canal cible à ajouter.\n\nExemple: <code>@mon_canal</code> ou <code>-100...</code>",
+            {
+              reply_markup: {
+                keyboard: [["❌ Annuler"]],
+                resize_keyboard: true,
+                one_time_keyboard: true,
+              },
+            },
+          );
+          return new Response("OK", { status: 200 });
+        }
+
+        const idMatch = text.match(/[0-9a-f]{8}/i);
+        const target = idMatch
+          ? await findOwnedRecord(
+              supabase,
+              "user_targets",
+              appUser.id,
+              idMatch[0],
+            )
+          : null;
+        if (!target || !target.is_active) {
+          await reply(
+            chatId,
+            "❌ Cible non reconnue. Choisis un bouton cible ou clique sur Annuler.",
+          );
+          return new Response("OK", { status: 200 });
+        }
+
+        const result = await createFlowForUser(
+          supabase,
+          appUser,
+          draft.source_id,
+          target.id,
+        );
+        if (result.error || !result.data) {
+          await reply(
+            chatId,
+            `❌ ${result.error || "Impossible de créer le flux."}`,
+            userMenuMarkup(),
+          );
+        } else {
+          await clearBotState(supabase, appUser.id);
+          await reply(
+            chatId,
+            `✅ <b>Flux créé avec succès</b>\n\nID: <code>${shortId(result.data.id)}</code>\nSource → Cible configurées.\n\nTu peux voir tes flux avec <b>🔁 Mes flux</b>.`,
+            userMenuMarkup(),
+          );
+        }
+        return new Response("OK", { status: 200 });
+      }
+
+      if (state.step === "new_flow_target_input") {
+        const { data: target, error } = await getOrCreateUserTarget(
+          supabase,
+          appUser.id,
+          text,
+        );
+        if (error || !target) {
+          await reply(
+            chatId,
+            `❌ ${error || "Impossible d'ajouter la cible."}\n\nRenvoie un canal cible valide ou clique sur Annuler.`,
+          );
+          return new Response("OK", { status: 200 });
+        }
+
+        const result = await createFlowForUser(
+          supabase,
+          appUser,
+          draft.source_id,
+          target.id,
+        );
+        if (result.error || !result.data) {
+          await clearBotState(supabase, appUser.id);
+          await reply(
+            chatId,
+            `❌ ${result.error || "Impossible de créer le flux."}`,
+            userMenuMarkup(),
+          );
+        } else {
+          await clearBotState(supabase, appUser.id);
+          await reply(
+            chatId,
+            `✅ <b>Flux créé avec succès</b>\n\nID: <code>${shortId(result.data.id)}</code>\nCible: <b>${target.chat_id}</b>\n\n⚠️ Vérifie que le bot est admin du canal cible.`,
+            userMenuMarkup(),
+          );
+        }
+        return new Response("OK", { status: 200 });
+      }
     }
 
     // ── User commands (non-admin allowed) ─────────────────────────────────
@@ -316,6 +774,7 @@ Deno.serve(async (req: Request) => {
           `<code>/me</code> — Mon compte\n` +
           `<code>/subscribe</code> — S'abonner\n\n` +
           `ℹ️ Pour publier vers ton canal, ajoute ce bot comme admin dans ton canal cible.`,
+        userMenuMarkup(),
       );
       return new Response("OK", { status: 200 });
     }
@@ -338,6 +797,7 @@ Deno.serve(async (req: Request) => {
           `Analyses aujourd'hui: <b>${used}/${limit}</b>\n\n` +
           `${premium && appUser.plan_expires_at ? `Expire: <b>${String(appUser.plan_expires_at).slice(0, 10)}</b>\n\n` : ""}` +
           `Pour t'abonner: <code>/subscribe</code>`,
+        userMenuMarkup(),
       );
       return new Response("OK", { status: 200 });
     }
@@ -349,6 +809,7 @@ Deno.serve(async (req: Request) => {
           `Prix: <b>500 FCFA / mois</b>\n` +
           `Avantages: flux illimités, plusieurs canaux/sources.\n\n` +
           `⏳ Paiement Nelsius Pay: en cours d'intégration.`,
+        userMenuMarkup(),
       );
       return new Response("OK", { status: 200 });
     }
@@ -802,7 +1263,7 @@ Deno.serve(async (req: Request) => {
 
     // ── /start | /help ────────────────────────────────────────────────────
     if (command === "/start" || command === "/help" || !command) {
-      await reply(chatId, HELP);
+      await reply(chatId, HELP, adminMenuMarkup());
     }
 
     // ── /stats ────────────────────────────────────────────────────────────
@@ -901,7 +1362,11 @@ Deno.serve(async (req: Request) => {
           if (error) {
             await reply(chatId, `❌ Erreur: ${error.message}`);
           } else {
-            await reply(chatId, `✅ Article supprimé:\n<i>${a.title}</i>`);
+            await reply(
+              chatId,
+              `✅ Article supprimé:\n<i>${a.title}</i>`,
+              adminMenuMarkup(),
+            );
           }
         }
       }
@@ -922,6 +1387,7 @@ Deno.serve(async (req: Request) => {
         await reply(
           chatId,
           `✅ TOUS les articles ont été supprimés de la base de données.`,
+          adminMenuMarkup(),
         );
       }
     }
@@ -1079,6 +1545,7 @@ Deno.serve(async (req: Request) => {
             `🗑 Articles DB supprimés: <b>${articles?.length || 0}</b>\n` +
             `🔄 Sources reset: <b>${resetCount}</b>\n\n` +
             `💡 Astuce: Utilise <code>/clearall force</code> pour supprimer les 100 derniers messages du canal (même sans tracking).`,
+          adminMenuMarkup(),
         );
       } catch (err) {
         console.error("[Bot] /clearall error:", err);
