@@ -175,14 +175,37 @@ Deno.serve(async (req: Request) => {
     end.setMonth(end.getMonth() + 1);
     const requestedPlan =
       payment.metadata?.plan === "pro_plus" ? "pro_plus" : "premium";
+    const walletToDeduct = Number(payment.metadata?.wallet_to_deduct || 0);
+
+    let userUpdate: Record<string, unknown> = {
+      plan: requestedPlan,
+      plan_expires_at: end.toISOString(),
+      is_active: true,
+    };
+
+    if (walletToDeduct > 0) {
+      const { data: user } = await supabase
+        .from("app_users")
+        .select("wallet_balance")
+        .eq("id", payment.user_id)
+        .maybeSingle();
+      const currentBalance = Number(user?.wallet_balance || 0);
+      const balanceAfter = Math.max(0, currentBalance - walletToDeduct);
+      userUpdate.wallet_balance = balanceAfter;
+      await supabase.from("wallet_transactions").insert({
+        user_id: payment.user_id,
+        payment_id: payment.id,
+        type: "subscription",
+        amount: -walletToDeduct,
+        currency: payment.currency,
+        balance_after: balanceAfter,
+        description: `Part wallet abonnement ${requestedPlan}`,
+      });
+    }
 
     await supabase
       .from("app_users")
-      .update({
-        plan: requestedPlan,
-        plan_expires_at: end.toISOString(),
-        is_active: true,
-      })
+      .update(userUpdate)
       .eq("id", payment.user_id);
 
     await supabase.from("subscriptions").insert({

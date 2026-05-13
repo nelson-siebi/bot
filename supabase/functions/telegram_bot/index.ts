@@ -87,8 +87,9 @@ function userMenuMarkup() {
         ["📡 Mes sources", "🎯 Mes cibles"],
         ["📊 Activité", "👤 Mon compte"],
         ["💳 Premium", "🚀 Pro Plus"],
-        ["💰 Dépôt", "🧾 Paiements"],
-        ["⚙️ Filtres Pro+", "❓ Aide"],
+        ["💰 Dépôt", "💼 Wallet"],
+        ["🧾 Paiements", "⚙️ Filtres Pro+"],
+        ["❓ Aide"],
       ],
       resize_keyboard: true,
       one_time_keyboard: false,
@@ -153,6 +154,7 @@ function commandFromButton(label: string): string | null {
     "🚀 Pro Plus": "/proplus",
     "💰 Dépôt": "/deposit",
     "🧾 Paiements": "/payments",
+    "💼 Wallet": "/wallet",
     "⚙️ Filtres Pro+": "/profilters",
     "❓ Aide": "/help",
     "▶️ Lancer agrégation": "/run",
@@ -431,6 +433,7 @@ async function createNelsiusCheckout(
   paymentType: "subscription" | "deposit",
   amount: number,
   plan: "premium" | "pro_plus" = "premium",
+  extraMetadata: Record<string, unknown> = {},
 ) {
   const secretKey = Deno.env.get("NELSIUS_SECRET_KEY") || "";
   if (!secretKey)
@@ -455,7 +458,11 @@ async function createNelsiusCheckout(
       currency: "XAF",
       status: "created",
       payment_type: paymentType,
-      metadata: { telegram_user_id: appUser.telegram_user_id, plan },
+      metadata: {
+        telegram_user_id: appUser.telegram_user_id,
+        plan,
+        ...extraMetadata,
+      },
     })
     .select("id")
     .maybeSingle();
@@ -520,6 +527,83 @@ async function createNelsiusCheckout(
       .eq("id", payment.id);
     return { checkoutUrl: null, error: (e as Error).message };
   }
+}
+
+async function activateSubscriptionFromWallet(
+  supabase: any,
+  appUser: any,
+  plan: "premium" | "pro_plus",
+  price: number,
+) {
+  const balance = Number(appUser.wallet_balance || 0);
+  if (balance < price) return { activated: false, error: "Solde insuffisant." };
+  const now = new Date();
+  const end = new Date(now);
+  end.setMonth(end.getMonth() + 1);
+  const balanceAfter = balance - price;
+
+  await supabase
+    .from("app_users")
+    .update({
+      wallet_balance: balanceAfter,
+      plan,
+      plan_expires_at: end.toISOString(),
+      is_active: true,
+    })
+    .eq("id", appUser.id);
+
+  await supabase.from("wallet_transactions").insert({
+    user_id: appUser.id,
+    type: "subscription",
+    amount: -price,
+    currency: "XAF",
+    balance_after: balanceAfter,
+    description: `Paiement abonnement ${plan === "pro_plus" ? "Pro Plus" : "Premium"} par wallet`,
+  });
+
+  await supabase.from("subscriptions").insert({
+    user_id: appUser.id,
+    provider: "wallet",
+    status: plan,
+    start_at: now.toISOString(),
+    end_at: end.toISOString(),
+    payment_reference: `WALLET_${plan.toUpperCase()}_${Date.now()}`,
+  });
+
+  return { activated: true, balanceAfter, end: end.toISOString(), error: null };
+}
+
+async function prepareSubscriptionPayment(
+  supabase: any,
+  appUser: any,
+  plan: "premium" | "pro_plus",
+  price: number,
+): Promise<any> {
+  const balance = Number(appUser.wallet_balance || 0);
+  if (balance >= price)
+    return await activateSubscriptionFromWallet(supabase, appUser, plan, price);
+
+  const paymentAmount = Math.max(100, price - balance);
+  const walletToDeduct = Math.max(0, price - paymentAmount);
+  const result = await createNelsiusCheckout(
+    supabase,
+    appUser,
+    "subscription",
+    paymentAmount,
+    plan,
+    {
+      subscription_price: price,
+      wallet_to_deduct: walletToDeduct,
+    },
+  );
+
+  return {
+    activated: false,
+    checkoutUrl: result.checkoutUrl,
+    error: result.error,
+    paymentAmount,
+    walletToDeduct,
+  };
 }
 
 async function promptBotAdminSetup(
@@ -1235,16 +1319,29 @@ Deno.serve(async (req: Request) => {
       (command === "/start" || command === "/help" || !command)
     ) {
       const premium = isPremium(appUser);
+      const proPlus = isProPlus(appUser);
+      const planLabel = proPlus
+        ? "🚀 Pro Plus"
+        : premium
+          ? "💳 Premium"
+          : "🆓 Gratuit";
       await reply(
         chatId,
-        `👋 Bienvenue !\n\n` +
-          `Plan: <b>${premium ? "Premium" : "Gratuit"}</b>\n` +
-          `- Gratuit: 1 flux (1 source → 1 canal cible), 5 analyses/jour\n` +
-          `- Premium: illimité (500 FCFA / mois)\n\n` +
-          `Commandes:\n` +
-          `<code>/me</code> — Mon compte\n` +
-          `<code>/subscribe</code> — S'abonner\n\n` +
-          `ℹ️ Pour publier vers ton canal, ajoute ce bot comme admin dans ton canal cible.`,
+        `👋 <b>Bienvenue sur ton assistant Telegram Auto</b>\n\n` +
+          `Ton plan actuel : <b>${planLabel}</b>\n\n` +
+          `🆓 <b>Gratuit</b>\n` +
+          `• Récupération illimitée\n` +
+          `• 1 flux actif : 1 source → 1 canal cible\n` +
+          `• Signature IzyNews ajoutée en bas des publications\n\n` +
+          `💳 <b>Premium — 500 FCFA/mois</b>\n` +
+          `• Plusieurs flux actifs\n` +
+          `• Pas de signature automatique\n\n` +
+          `🚀 <b>Pro Plus — 1000 FCFA/mois</b>\n` +
+          `• Tout Premium\n` +
+          `• Traduction automatique\n` +
+          `• Filtres avancés par flux\n` +
+          `• Remplacement mots/liens et suppression pubs\n\n` +
+          `👉 Clique sur <b>➕ Nouveau flux</b> pour commencer.`,
         userMenuMarkup(),
       );
       return new Response("OK", { status: 200 });
@@ -1262,12 +1359,12 @@ Deno.serve(async (req: Request) => {
         .eq("day", today)
         .maybeSingle();
       const used = usage?.analyzed_count ?? 0;
-      const limit = premium ? "∞" : "5";
+      const limit = "∞";
       await reply(
         chatId,
         `👤 <b>Mon compte</b>\n\n` +
           `Plan: <b>${planLabel}</b>\n` +
-          `Analyses aujourd'hui: <b>${used}/${limit}</b>\n` +
+          `Messages analysés aujourd'hui: <b>${used}/${limit}</b>\n` +
           `Solde wallet: <b>${appUser.wallet_balance || 0} XAF</b>\n\n` +
           `${premium && appUser.plan_expires_at ? `Expire: <b>${String(appUser.plan_expires_at).slice(0, 10)}</b>\n\n` : ""}` +
           `Pour t'abonner: <code>/subscribe</code>\nPour déposer: <code>/deposit montant</code>\nPaiements: <code>/payments</code>`,
@@ -1277,14 +1374,23 @@ Deno.serve(async (req: Request) => {
     }
 
     if (!adminMode && command === "/subscribe") {
-      await reply(chatId, "⏳ Création du lien de paiement Premium...");
-      const result = await createNelsiusCheckout(
+      await reply(
+        chatId,
+        "⏳ Vérification de ton wallet et préparation Premium...",
+      );
+      const result = await prepareSubscriptionPayment(
         supabase,
         appUser,
-        "subscription",
+        "premium",
         500,
       );
-      if (result.error || !result.checkoutUrl) {
+      if (result.activated) {
+        await reply(
+          chatId,
+          `✅ <b>Premium activé directement avec ton wallet</b>\n\nSolde restant: <b>${result.balanceAfter} XAF</b>`,
+          userMenuMarkup(),
+        );
+      } else if (result.error || !result.checkoutUrl) {
         await reply(
           chatId,
           `❌ Paiement indisponible: ${result.error}`,
@@ -1293,18 +1399,23 @@ Deno.serve(async (req: Request) => {
       } else {
         await reply(
           chatId,
-          `💳 <b>Abonnement Premium</b>\n\nPrix: <b>500 FCFA / mois</b>\n\nClique sur le bouton ci-dessous pour payer avec Nelsius Pay. Ton compte deviendra Premium automatiquement après confirmation du paiement.`,
+          `💳 <b>Abonnement Premium</b>\n\nPrix: <b>500 FCFA / mois</b>\nSolde utilisé: <b>${result.walletToDeduct || 0} XAF</b>\nÀ compléter: <b>${result.paymentAmount} XAF</b>\n\nClique sur le bouton ci-dessous pour compléter avec Nelsius Pay.`,
           {
             reply_markup: {
               inline_keyboard: [
-                [{ text: "💳 Payer 500 FCFA", url: result.checkoutUrl }],
+                [
+                  {
+                    text: `💳 Payer ${result.paymentAmount} FCFA`,
+                    url: result.checkoutUrl,
+                  },
+                ],
               ],
             },
           },
         );
         await reply(
           chatId,
-          "Après paiement, reviens ici et clique sur 🧾 Paiements pour suivre le statut. /me affichera ton profil une fois le paiement confirmé.",
+          "Après paiement, clique sur 🧾 Paiements pour suivre le statut.",
           userMenuMarkup(),
         );
       }
@@ -1312,15 +1423,23 @@ Deno.serve(async (req: Request) => {
     }
 
     if (!adminMode && command === "/proplus") {
-      await reply(chatId, "⏳ Création du lien de paiement Pro Plus...");
-      const result = await createNelsiusCheckout(
+      await reply(
+        chatId,
+        "⏳ Vérification de ton wallet et préparation Pro Plus...",
+      );
+      const result = await prepareSubscriptionPayment(
         supabase,
         appUser,
-        "subscription",
-        1000,
         "pro_plus",
+        1000,
       );
-      if (result.error || !result.checkoutUrl) {
+      if (result.activated) {
+        await reply(
+          chatId,
+          `✅ <b>Pro Plus activé directement avec ton wallet</b>\n\nSolde restant: <b>${result.balanceAfter} XAF</b>`,
+          userMenuMarkup(),
+        );
+      } else if (result.error || !result.checkoutUrl) {
         await reply(
           chatId,
           `❌ Paiement indisponible: ${result.error}`,
@@ -1329,11 +1448,16 @@ Deno.serve(async (req: Request) => {
       } else {
         await reply(
           chatId,
-          `🚀 <b>Abonnement Pro Plus</b>\n\nPrix: <b>1000 FCFA / mois</b>\n\nInclus: traduction automatique, filtres avancés par flux, remplacement de mots/liens, suppression publicités, signatures personnalisées.`,
+          `🚀 <b>Abonnement Pro Plus</b>\n\nPrix: <b>1000 FCFA / mois</b>\nSolde utilisé: <b>${result.walletToDeduct || 0} XAF</b>\nÀ compléter: <b>${result.paymentAmount} XAF</b>\n\nInclus: traduction, filtres avancés, remplacement mots/liens et suppression pubs.`,
           {
             reply_markup: {
               inline_keyboard: [
-                [{ text: "🚀 Payer 1000 FCFA", url: result.checkoutUrl }],
+                [
+                  {
+                    text: `🚀 Payer ${result.paymentAmount} FCFA`,
+                    url: result.checkoutUrl,
+                  },
+                ],
               ],
             },
           },
@@ -1351,6 +1475,27 @@ Deno.serve(async (req: Request) => {
       await reply(
         chatId,
         `⚙️ <b>Filtres Pro Plus</b>\n\nCes commandes fonctionnent avec un abonnement Pro Plus actif.\n\nTraduction:\n<code>/translate flow_id fr on</code>\n<code>/translate flow_id en on</code>\n\nRemplacer mots:\n<code>/replace flow_id ancien => nouveau</code>\n\nLiens:\n<code>/links flow_id remove</code>\n<code>/links flow_id replace https://ton-lien.com</code>\n<code>/links flow_id keep</code>\n\nPublicités:\n<code>/blockads flow_id on</code>\n\nMots interdits/obligatoires:\n<code>/include flow_id mot1,mot2</code>\n<code>/exclude flow_id mot1,mot2</code>`,
+        userMenuMarkup(),
+      );
+      return new Response("OK", { status: 200 });
+    }
+
+    if (!adminMode && command === "/wallet") {
+      const { data: txs } = await supabase
+        .from("wallet_transactions")
+        .select(
+          "type, amount, currency, balance_after, description, created_at",
+        )
+        .eq("user_id", appUser.id)
+        .order("created_at", { ascending: false })
+        .limit(8);
+      const lines = (txs || []).map((t: any) => {
+        const sign = Number(t.amount) >= 0 ? "+" : "";
+        return `${sign}${t.amount} ${t.currency} — ${t.description || t.type}\nSolde après: <b>${t.balance_after} ${t.currency}</b>`;
+      });
+      await reply(
+        chatId,
+        `💼 <b>Mon wallet</b>\n\nSolde actuel: <b>${appUser.wallet_balance || 0} XAF</b>\n\n${lines.length ? lines.join("\n\n") : "Aucune transaction pour le moment."}`,
         userMenuMarkup(),
       );
       return new Response("OK", { status: 200 });

@@ -1186,24 +1186,6 @@ Deno.serve(async (_req: Request) => {
           analyzedForThisFlow++;
           maxMsgId = Math.max(maxMsgId, msg.id);
 
-          if (!premium && analyzedForThisFlow > 5) {
-            skippedCount++;
-            await recordActivity(supabase, {
-              user_id: user.id,
-              flow_id: flow.id,
-              source_id: source.id,
-              target_id: target.id,
-              source_message_id: msg.id,
-              status: "skipped",
-              reason: "free_daily_limit",
-              original_url: `https://t.me/${channel}/${msg.id}`,
-              text_preview: msg.text.substring(0, 200),
-              media_count:
-                (msg.photoUrls?.length || 0) + (msg.videoUrl ? 1 : 0),
-            });
-            continue;
-          }
-
           if (msg.text.length < 20 && !msg.hasMedia) continue;
 
           const originalUrl = `https://t.me/${channel}/${msg.id}`;
@@ -1273,7 +1255,11 @@ Deno.serve(async (_req: Request) => {
             msg.videoUrl && (!msg.videoDuration || msg.videoDuration <= 60);
           let telegramMsgId: number | null = null;
 
-          if (isShortVideo && msg.videoUrl && filters.allow_videos) {
+          if (
+            isShortVideo &&
+            msg.videoUrl &&
+            (proPlus ? filters.allow_videos : true)
+          ) {
             telegramMsgId = await sendVideoToTelegram(
               textToPublish,
               msg.videoUrl,
@@ -1282,7 +1268,7 @@ Deno.serve(async (_req: Request) => {
           } else if (
             msg.photoUrls &&
             msg.photoUrls.length > 1 &&
-            filters.allow_albums
+            (proPlus ? filters.allow_albums : true)
           ) {
             const albumUrls = msg.photoUrls.slice(0, 10);
             telegramMsgId = await sendAlbumToTelegram(
@@ -1293,14 +1279,14 @@ Deno.serve(async (_req: Request) => {
           } else if (
             msg.photoUrls &&
             msg.photoUrls.length > 0 &&
-            filters.allow_photos
+            (proPlus ? filters.allow_photos : true)
           ) {
             telegramMsgId = await sendPhotoToTelegram(
               textToPublish,
               msg.photoUrls[0],
               targetChatId,
             );
-          } else if (filters.allow_text) {
+          } else if (proPlus ? filters.allow_text : true) {
             telegramMsgId = await sendTextToTelegram(
               textToPublish,
               targetChatId,
