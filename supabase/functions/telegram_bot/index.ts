@@ -127,6 +127,7 @@ function commandFromButton(label: string): string | null {
     "🗑 DB seulement": "/deleteall",
     "🔥 Tout supprimer": "/clearall",
     "❓ Aide admin": "/help",
+    "✅ J’ai ajouté le bot": "/verifytargetadmin",
     "❌ Annuler": "/cancel",
   };
   return map[label] || null;
@@ -318,6 +319,98 @@ async function createFlowForUser(
     .select("id")
     .maybeSingle();
   return { data, error: error?.message || null };
+}
+
+async function getBotInfo(): Promise<{ id: number; username: string } | null> {
+  try {
+    const res = await fetch(`${BASE}/getMe`);
+    const data = await res.json();
+    if (data.ok && data.result?.id && data.result?.username) {
+      return { id: data.result.id, username: data.result.username };
+    }
+  } catch (e) {
+    console.error("[Bot] getMe failed:", e);
+  }
+  return null;
+}
+
+function botAdminUrl(username: string): string {
+  return `https://t.me/${username}?startchannel=setup&admin=post_messages+edit_messages+delete_messages`;
+}
+
+async function checkBotAdminInChat(
+  targetChatId: string,
+): Promise<{ ok: boolean; reason?: string }> {
+  const bot = await getBotInfo();
+  if (!bot)
+    return {
+      ok: false,
+      reason: "Impossible d'identifier le bot via Telegram.",
+    };
+  try {
+    const res = await fetch(`${BASE}/getChatMember`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: targetChatId, user_id: bot.id }),
+    });
+    const data = await res.json();
+    if (!data.ok)
+      return {
+        ok: false,
+        reason:
+          data.description || "Le bot n'est pas encore visible dans ce canal.",
+      };
+    const status = data.result?.status;
+    if (status === "administrator" || status === "creator") return { ok: true };
+    return {
+      ok: false,
+      reason: `Statut actuel: ${status || "inconnu"}. Le bot doit être administrateur.`,
+    };
+  } catch (e) {
+    return { ok: false, reason: (e as Error).message };
+  }
+}
+
+async function promptBotAdminSetup(
+  chatId: number | string,
+  targetChatId: string,
+) {
+  const bot = await getBotInfo();
+  if (bot) {
+    await reply(
+      chatId,
+      `🔐 <b>Autorisation nécessaire</b>\n\nPour publier dans <b>${targetChatId}</b>, ajoute le bot comme administrateur du canal.\n\nClique sur le bouton ci-dessous pour ouvrir Telegram et choisir ton canal.`,
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              {
+                text: "➕ Ajouter le bot comme admin",
+                url: botAdminUrl(bot.username),
+              },
+            ],
+          ],
+        },
+      },
+    );
+  } else {
+    await reply(
+      chatId,
+      `🔐 Ajoute ce bot comme administrateur dans <b>${targetChatId}</b>.`,
+    );
+  }
+
+  await reply(
+    chatId,
+    "Quand c'est fait, reviens ici et clique sur <b>✅ J’ai ajouté le bot</b>.",
+    {
+      reply_markup: {
+        keyboard: [["✅ J’ai ajouté le bot"], ["❌ Annuler"]],
+        resize_keyboard: true,
+        one_time_keyboard: true,
+      },
+    },
+  );
 }
 
 async function reply(
@@ -599,6 +692,62 @@ Deno.serve(async (req: Request) => {
       return new Response("OK", { status: 200 });
     }
 
+    if (!adminMode && command === "/verifytargetadmin") {
+      const state = appUser.bot_state || {};
+      const draft = state.draft || {};
+      if (
+        state.step !== "new_flow_verify_target" ||
+        !draft.source_id ||
+        !draft.target_id ||
+        !draft.target_chat_id
+      ) {
+        await reply(
+          chatId,
+          "ℹ️ Aucun canal cible en attente de vérification.",
+          userMenuMarkup(),
+        );
+        return new Response("OK", { status: 200 });
+      }
+
+      const check = await checkBotAdminInChat(String(draft.target_chat_id));
+      if (!check.ok) {
+        await reply(
+          chatId,
+          `❌ Je ne suis pas encore admin de <b>${draft.target_chat_id}</b>.\n\nDétail: ${check.reason || "vérification impossible"}\n\nAjoute le bot comme admin puis clique encore sur <b>✅ J’ai ajouté le bot</b>.`,
+          {
+            reply_markup: {
+              keyboard: [["✅ J’ai ajouté le bot"], ["❌ Annuler"]],
+              resize_keyboard: true,
+              one_time_keyboard: true,
+            },
+          },
+        );
+        return new Response("OK", { status: 200 });
+      }
+
+      const result = await createFlowForUser(
+        supabase,
+        appUser,
+        String(draft.source_id),
+        String(draft.target_id),
+      );
+      await clearBotState(supabase, appUser.id);
+      if (result.error || !result.data) {
+        await reply(
+          chatId,
+          `❌ ${result.error || "Impossible de créer le flux."}`,
+          userMenuMarkup(),
+        );
+      } else {
+        await reply(
+          chatId,
+          `✅ <b>Bot confirmé admin</b>\n\nTon flux est créé avec succès.\nID: <code>${shortId(result.data.id)}</code>\nCible: <b>${draft.target_chat_id}</b>`,
+          userMenuMarkup(),
+        );
+      }
+      return new Response("OK", { status: 200 });
+    }
+
     if (
       !adminMode &&
       appUser.bot_state?.step &&
@@ -696,26 +845,15 @@ Deno.serve(async (req: Request) => {
           return new Response("OK", { status: 200 });
         }
 
-        const result = await createFlowForUser(
-          supabase,
-          appUser,
-          draft.source_id,
-          target.id,
-        );
-        if (result.error || !result.data) {
-          await reply(
-            chatId,
-            `❌ ${result.error || "Impossible de créer le flux."}`,
-            userMenuMarkup(),
-          );
-        } else {
-          await clearBotState(supabase, appUser.id);
-          await reply(
-            chatId,
-            `✅ <b>Flux créé avec succès</b>\n\nID: <code>${shortId(result.data.id)}</code>\nSource → Cible configurées.\n\nTu peux voir tes flux avec <b>🔁 Mes flux</b>.`,
-            userMenuMarkup(),
-          );
-        }
+        await setBotState(supabase, appUser.id, {
+          step: "new_flow_verify_target",
+          draft: {
+            source_id: draft.source_id,
+            target_id: target.id,
+            target_chat_id: target.chat_id,
+          },
+        });
+        await promptBotAdminSetup(chatId, target.chat_id);
         return new Response("OK", { status: 200 });
       }
 
@@ -733,27 +871,15 @@ Deno.serve(async (req: Request) => {
           return new Response("OK", { status: 200 });
         }
 
-        const result = await createFlowForUser(
-          supabase,
-          appUser,
-          draft.source_id,
-          target.id,
-        );
-        if (result.error || !result.data) {
-          await clearBotState(supabase, appUser.id);
-          await reply(
-            chatId,
-            `❌ ${result.error || "Impossible de créer le flux."}`,
-            userMenuMarkup(),
-          );
-        } else {
-          await clearBotState(supabase, appUser.id);
-          await reply(
-            chatId,
-            `✅ <b>Flux créé avec succès</b>\n\nID: <code>${shortId(result.data.id)}</code>\nCible: <b>${target.chat_id}</b>\n\n⚠️ Vérifie que le bot est admin du canal cible.`,
-            userMenuMarkup(),
-          );
-        }
+        await setBotState(supabase, appUser.id, {
+          step: "new_flow_verify_target",
+          draft: {
+            source_id: draft.source_id,
+            target_id: target.id,
+            target_chat_id: target.chat_id,
+          },
+        });
+        await promptBotAdminSetup(chatId, target.chat_id);
         return new Response("OK", { status: 200 });
       }
     }
