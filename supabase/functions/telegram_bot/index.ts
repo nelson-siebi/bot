@@ -1,30 +1,42 @@
-import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-const BOT_TOKEN = Deno.env.get('TELEGRAM_BOT_TOKEN') || '';
-const OUTPUT_CHAT_ID = Deno.env.get('TELEGRAM_CHAT_ID') || '';
+declare const Deno: any;
+
+const BOT_TOKEN = Deno.env.get("TELEGRAM_BOT_TOKEN") || "";
+const OUTPUT_CHAT_ID = Deno.env.get("TELEGRAM_CHAT_ID") || "";
 const BASE = `https://api.telegram.org/bot${BOT_TOKEN}`;
 
 // Admin IDs: comma-separated Telegram user/chat IDs allowed to control the bot
-const ADMIN_IDS = (Deno.env.get('TELEGRAM_ADMIN_IDS') || OUTPUT_CHAT_ID)
-  .split(',').map(id => id.trim()).filter(Boolean);
+const ADMIN_IDS = (Deno.env.get("TELEGRAM_ADMIN_IDS") || OUTPUT_CHAT_ID)
+  .split(",")
+  .map((id: string) => id.trim())
+  .filter(Boolean);
 
 function isAdmin(id: number | string): boolean {
   return ADMIN_IDS.includes(String(id));
 }
 
-async function getOrCreateAppUser(supabase: any, telegramUserId: number, username?: string) {
+async function getOrCreateAppUser(
+  supabase: any,
+  telegramUserId: number,
+  username?: string,
+) {
   const { data: existing, error: selErr } = await supabase
-    .from('app_users')
-    .select('*')
-    .eq('telegram_user_id', telegramUserId)
+    .from("app_users")
+    .select("*")
+    .eq("telegram_user_id", telegramUserId)
     .maybeSingle();
   if (selErr) throw selErr;
   if (existing) return existing;
 
   const { data: inserted, error: insErr } = await supabase
-    .from('app_users')
-    .insert({ telegram_user_id: telegramUserId, username: username || null, is_admin: false })
-    .select('*')
+    .from("app_users")
+    .insert({
+      telegram_user_id: telegramUserId,
+      username: username || null,
+      is_admin: false,
+    })
+    .select("*")
     .maybeSingle();
   if (insErr) throw insErr;
   return inserted;
@@ -32,38 +44,137 @@ async function getOrCreateAppUser(supabase: any, telegramUserId: number, usernam
 
 function isPremium(user: any): boolean {
   if (!user) return false;
-  if (user.plan !== 'premium') return false;
+  if (user.plan !== "premium") return false;
   if (!user.plan_expires_at) return true;
   return new Date(user.plan_expires_at).getTime() > Date.now();
 }
 
-async function reply(chatId: number | string, text: string, extra: Record<string, unknown> = {}) {
+const DEFAULT_FLOW_FILTERS = {
+  include_keywords: [],
+  exclude_keywords: [],
+  block_ads: true,
+  media_only: false,
+  allow_text: true,
+  allow_photos: true,
+  allow_videos: true,
+  allow_albums: true,
+  use_ai_rewrite: false,
+  remove_links: false,
+  remove_mentions: false,
+  signature_text: "",
+};
+
+const USER_HELP = `🤖 <b>Bot Telegram Auto — Espace utilisateur</b>\n\n<b>📡 Sources</b>\n/addsource &lt;@canal ou URL t.me&gt; — Ajouter un canal source\n/sources — Mes sources\n/delsource &lt;id&gt; — Désactiver une source\n\n<b>🎯 Canaux cibles</b>\n/addtarget &lt;@canal ou -100...&gt; [nom] — Ajouter un canal cible\n/targets — Mes canaux cibles\n/deltarget &lt;id&gt; — Désactiver un canal cible\n\n<b>🔁 Flux</b>\n/addflow &lt;source_id&gt; &lt;target_id&gt; — Relier source → cible\n/flows — Mes flux\n/pauseflow &lt;id&gt; — Mettre en pause\n/resumeflow &lt;id&gt; — Reprendre\n/deleteflow &lt;id&gt; — Supprimer/désactiver\n\n<b>🧰 Filtres</b>\n/filters &lt;flow_id&gt; — Voir les filtres\n/include &lt;flow_id&gt; mot1,mot2 — Mots obligatoires\n/exclude &lt;flow_id&gt; mot1,mot2 — Mots interdits\n/blockads &lt;flow_id&gt; on|off — Bloquer les pubs\n/mediaonly &lt;flow_id&gt; on|off — Publier seulement les médias\n/allowalbums &lt;flow_id&gt; on|off — Autoriser les albums\n/rewriteai &lt;flow_id&gt; on|off — Reformulation IA\n/signature &lt;flow_id&gt; texte — Signature ajoutée\n\n<b>📊 Activité</b>\n/activity — Dernières actions\n/me — Mon compte\n/subscribe — Abonnement Premium`;
+
+function shortId(id: string): string {
+  return String(id || "").substring(0, 8);
+}
+
+function normalizeTelegramChannel(input: string): string {
+  let channel = (input || "").trim();
+  if (channel.includes("t.me/")) {
+    const parts = channel.split("t.me/");
+    channel = parts[parts.length - 1].split("/")[0].split("?")[0];
+  }
+  return channel.replace(/^@/, "").trim().toLowerCase();
+}
+
+function normalizeTargetChat(input: string): string {
+  const raw = (input || "").trim();
+  if (!raw) return "";
+  if (raw.startsWith("-100")) return raw;
+  const channel = normalizeTelegramChannel(raw);
+  return channel ? `@${channel}` : "";
+}
+
+function parseKeywordList(raw: string): string[] {
+  return raw
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean)
+    .slice(0, 30);
+}
+
+function parseOnOff(value: string | undefined): boolean | null {
+  const v = String(value || "")
+    .trim()
+    .toLowerCase();
+  if (["on", "oui", "yes", "true", "1", "actif"].includes(v)) return true;
+  if (["off", "non", "no", "false", "0", "inactif"].includes(v)) return false;
+  return null;
+}
+
+function mergeFilters(current: any, patch: Record<string, unknown>) {
+  return { ...DEFAULT_FLOW_FILTERS, ...(current || {}), ...patch };
+}
+
+async function findOwnedRecord(
+  supabase: any,
+  table: string,
+  userId: string,
+  idPrefix: string,
+) {
+  if (!idPrefix) return null;
+  const { data } = await supabase
+    .from(table)
+    .select("*")
+    .eq("user_id", userId)
+    .ilike("id", `${idPrefix}%`)
+    .limit(1)
+    .maybeSingle();
+  return data || null;
+}
+
+async function reply(
+  chatId: number | string,
+  text: string,
+  extra: Record<string, unknown> = {},
+) {
   try {
     const res = await fetch(`${BASE}/sendMessage`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: chatId, text: text.substring(0, 4096), parse_mode: 'HTML', ...extra }),
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: text.substring(0, 4096),
+        parse_mode: "HTML",
+        ...extra,
+      }),
     });
-    if (!res.ok) console.error('[Bot] sendMessage failed:', await res.text());
+    if (!res.ok) console.error("[Bot] sendMessage failed:", await res.text());
   } catch (e) {
-    console.error('[Bot] sendMessage exception:', e);
+    console.error("[Bot] sendMessage exception:", e);
   }
 }
 
-async function sendPhotoToChat(chatId: number | string, photoFileId: string, caption: string) {
+async function sendPhotoToChat(
+  chatId: number | string,
+  photoFileId: string,
+  caption: string,
+) {
   try {
     const res = await fetch(`${BASE}/sendPhoto`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: chatId, photo: photoFileId, caption: caption.substring(0, 1024), parse_mode: 'HTML' }),
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        photo: photoFileId,
+        caption: caption.substring(0, 1024),
+        parse_mode: "HTML",
+      }),
     });
-    if (!res.ok) console.error('[Bot] sendPhoto failed:', await res.text());
+    if (!res.ok) console.error("[Bot] sendPhoto failed:", await res.text());
   } catch (e) {
-    console.error('[Bot] sendPhoto exception:', e);
+    console.error("[Bot] sendPhoto exception:", e);
   }
 }
 
-async function copyMessageToChat(chatId: number | string, fromChatId: number | string, messageId: number, caption?: string) {
+async function copyMessageToChat(
+  chatId: number | string,
+  fromChatId: number | string,
+  messageId: number,
+  caption?: string,
+) {
   const body: any = {
     chat_id: chatId,
     from_chat_id: fromChatId,
@@ -71,38 +182,49 @@ async function copyMessageToChat(chatId: number | string, fromChatId: number | s
   };
   if (caption !== undefined) {
     body.caption = caption.substring(0, 1024);
-    body.parse_mode = 'HTML';
+    body.parse_mode = "HTML";
   }
   try {
     const res = await fetch(`${BASE}/copyMessage`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
     const data = await res.json();
-    if (!data.ok) console.error('[Bot] copyMessage failed:', data);
+    if (!data.ok) console.error("[Bot] copyMessage failed:", data);
     return data;
   } catch (e) {
-    console.error('[Bot] copyMessage exception:', e);
+    console.error("[Bot] copyMessage exception:", e);
     return { ok: false, error: e };
   }
 }
 
-async function restructureWithAI(rawText: string, apiKey: string): Promise<{ title: string, content: string, isAd: boolean }> {
-  if (!apiKey || !rawText || rawText.length < 5) return { title: '', content: rawText, isAd: false };
+async function restructureWithAI(
+  rawText: string,
+  apiKey: string,
+): Promise<{ title: string; content: string; isAd: boolean }> {
+  if (!apiKey || !rawText || rawText.length < 5)
+    return { title: "", content: rawText, isAd: false };
   try {
-    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{
-          parts: [{
-            text: `Tu es un journaliste professionnel et éditeur de nouvelles pour le canal Telegram @izynews.\nVoici une information brute issue d'un canal source :\n\n${rawText}\n\nInstructions :\n1. Analyse très attentivement le texte. S'il s'agit d'une publicité, d'un contenu sponsorisé, d'un appel commercial, de crypto-monnaie promotionnelle ou de spam, mets IMPÉRATIVEMENT "is_ad": true dans le JSON.\n2. Si ce n'est pas une pub, reformule l'information pour qu'elle soit claire, percutante, professionnelle, et attrayante.\n3. Écris un titre court et captivant (max 100 caractères), TOUJOURS bien stylisé et agrémenté de PLUSIEURS émojis (stickers) variés en rapport direct avec la situation pour attirer l'oeil.\n4. Intègre ce titre tout en haut du contenu reformulé, en le mettant en gras avec des balises HTML (<b>Titre</b>).\n5. Ajoute des émojis pertinents tout au long du texte pour aérer la lecture.\n6. Conserve les détails importants (dates, lieux, personnes).\n7. Ne mets PAS "@izynews" à la fin, je le ferai programmatiquement.\n\nRéponds UNIQUEMENT au format JSON strict suivant :\n{\n  "is_ad": false,\n  "title": "Titre stylisé avec emojis 🚀",\n  "content": "<b>Titre stylisé avec emojis 🚀</b>\\n\\nContenu reformulé ici avec des émojis... ✅"\n}`
-          }]
-        }],
-        generationConfig: { responseMimeType: "application/json" }
-      })
-    });
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [
+            {
+              parts: [
+                {
+                  text: `Tu es un journaliste professionnel et éditeur de nouvelles pour le canal Telegram @izynews.\nVoici une information brute issue d'un canal source :\n\n${rawText}\n\nInstructions :\n1. Analyse très attentivement le texte. S'il s'agit d'une publicité, d'un contenu sponsorisé, d'un appel commercial, de crypto-monnaie promotionnelle ou de spam, mets IMPÉRATIVEMENT "is_ad": true dans le JSON.\n2. Si ce n'est pas une pub, reformule l'information pour qu'elle soit claire, percutante, professionnelle, et attrayante.\n3. Écris un titre court et captivant (max 100 caractères), TOUJOURS bien stylisé et agrémenté de PLUSIEURS émojis (stickers) variés en rapport direct avec la situation pour attirer l'oeil.\n4. Intègre ce titre tout en haut du contenu reformulé, en le mettant en gras avec des balises HTML (<b>Titre</b>).\n5. Ajoute des émojis pertinents tout au long du texte pour aérer la lecture.\n6. Conserve les détails importants (dates, lieux, personnes).\n7. Ne mets PAS "@izynews" à la fin, je le ferai programmatiquement.\n\nRéponds UNIQUEMENT au format JSON strict suivant :\n{\n  "is_ad": false,\n  "title": "Titre stylisé avec emojis 🚀",\n  "content": "<b>Titre stylisé avec emojis 🚀</b>\\n\\nContenu reformulé ici avec des émojis... ✅"\n}`,
+                },
+              ],
+            },
+          ],
+          generationConfig: { responseMimeType: "application/json" },
+        }),
+      },
+    );
     const data = await res.json();
     const textResp = data.candidates?.[0]?.content?.parts?.[0]?.text;
     if (textResp) {
@@ -112,47 +234,61 @@ async function restructureWithAI(rawText: string, apiKey: string): Promise<{ tit
         jsonStr = match[1].trim();
       }
       const parsed = JSON.parse(jsonStr);
-      return { 
-        title: parsed.title || '', 
+      return {
+        title: parsed.title || "",
         content: parsed.content || rawText,
-        isAd: parsed.is_ad === true
+        isAd: parsed.is_ad === true,
       };
     }
-  } catch(e) {
-    console.error('[Gemini] Error:', e);
+  } catch (e) {
+    console.error("[Gemini] Error:", e);
   }
-  return { title: '', content: rawText, isAd: false };
+  return { title: "", content: rawText, isAd: false };
 }
 
 // ── HELP TEXT ─────────────────────────────────────────────────────────────────
 const HELP = `🤖 <b>Bot Admin — Gestion des infos</b>\n\n<b>📰 Articles</b>\n/list [n] — Derniers articles (défaut: 10, max: 20)\n/article &lt;id&gt; — Voir un article\n/delete &lt;id&gt; — Supprimer un article\n/deleteall — Supprimer TOUS les articles (DB seulement)\n/clearall — Supprimer TOUT (canal Telegram + DB + reset sources)\n/clearall force — Supprimer les 100 derniers messages du canal (nucléaire)\n/publish &lt;texte&gt; — Publier un article (texte)\n  ↳ Envoie une photo avec /publish en légende pour publier avec image\n\n<b>📡 Sources Telegram</b>\n/sources — Liste des sources actives\n/addsource &lt;@canal ou URL&gt; — Ajouter un canal Telegram\n/delsource &lt;id&gt; — Désactiver une source\n\n<b>⚙️ Système</b>\n/run — Lancer l'agrégation maintenant\n/stats — Statistiques de la plateforme\n/help — Afficher ce message`;
 
-Deno.serve(async (req) => {
-  if (req.method !== 'POST') {
-    return new Response('Telegram Bot Webhook — OK', { status: 200 });
+Deno.serve(async (req: Request) => {
+  if (req.method !== "POST") {
+    return new Response("Telegram Bot Webhook — OK", { status: 200 });
   }
 
   let body: Record<string, unknown>;
-  try { body = await req.json(); } catch { return new Response('Bad Request', { status: 400 }); }
+  try {
+    body = await req.json();
+  } catch {
+    return new Response("Bad Request", { status: 400 });
+  }
 
-  const message = (body.message || body.edited_message) as Record<string, unknown> | undefined;
-  if (!message) return new Response('OK', { status: 200 });
+  const message = (body.message || body.edited_message) as
+    | Record<string, unknown>
+    | undefined;
+  if (!message) return new Response("OK", { status: 200 });
 
   const chatId = (message.chat as any)?.id as number;
   const userId = (message.from as any)?.id as number;
-  const username = ((message.from as any)?.username as string | undefined) || undefined;
+  const username =
+    ((message.from as any)?.username as string | undefined) || undefined;
   const messageId = message.message_id as number;
-  const text = ((message.text || message.caption || '') as string).trim();
+  const text = ((message.text || message.caption || "") as string).trim();
   const photo = (message.photo as any[]) || null;
-  const hasMedia = !!(photo || message.video || message.document || message.audio || message.animation || message.voice);
+  const hasMedia = !!(
+    photo ||
+    message.video ||
+    message.document ||
+    message.audio ||
+    message.animation ||
+    message.voice
+  );
 
   const supabase = createClient(
-    Deno.env.get('SUPABASE_URL') ?? '',
-    Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '',
+    Deno.env.get("SUPABASE_URL") ?? "",
+    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "",
   );
 
   const parts = text.split(/\s+/);
-  const command = parts[0]?.toLowerCase() || '';
+  const command = parts[0]?.toLowerCase() || "";
   const args = parts.slice(1);
 
   const adminMode = isAdmin(chatId) || isAdmin(userId);
@@ -165,111 +301,574 @@ Deno.serve(async (req) => {
     }
 
     // ── User commands (non-admin allowed) ─────────────────────────────────
-    if (!adminMode && (command === '/start' || command === '/help' || !command)) {
+    if (
+      !adminMode &&
+      (command === "/start" || command === "/help" || !command)
+    ) {
       const premium = isPremium(appUser);
       await reply(
         chatId,
         `👋 Bienvenue !\n\n` +
-          `Plan: <b>${premium ? 'Premium' : 'Gratuit'}</b>\n` +
+          `Plan: <b>${premium ? "Premium" : "Gratuit"}</b>\n` +
           `- Gratuit: 1 flux (1 source → 1 canal cible), 5 analyses/jour\n` +
           `- Premium: illimité (500 FCFA / mois)\n\n` +
           `Commandes:\n` +
           `<code>/me</code> — Mon compte\n` +
           `<code>/subscribe</code> — S'abonner\n\n` +
-          `ℹ️ Pour publier vers ton canal, ajoute ce bot comme admin dans ton canal cible.`
+          `ℹ️ Pour publier vers ton canal, ajoute ce bot comme admin dans ton canal cible.`,
       );
-      return new Response('OK', { status: 200 });
+      return new Response("OK", { status: 200 });
     }
 
-    if (!adminMode && command === '/me') {
+    if (!adminMode && command === "/me") {
       const premium = isPremium(appUser);
       const today = new Date().toISOString().slice(0, 10);
       const { data: usage } = await supabase
-        .from('usage_daily')
-        .select('analyzed_count')
-        .eq('user_id', appUser.id)
-        .eq('day', today)
+        .from("usage_daily")
+        .select("analyzed_count")
+        .eq("user_id", appUser.id)
+        .eq("day", today)
         .maybeSingle();
       const used = usage?.analyzed_count ?? 0;
-      const limit = premium ? '∞' : '5';
+      const limit = premium ? "∞" : "5";
       await reply(
         chatId,
         `👤 <b>Mon compte</b>\n\n` +
-          `Plan: <b>${premium ? 'Premium' : 'Gratuit'}</b>\n` +
+          `Plan: <b>${premium ? "Premium" : "Gratuit"}</b>\n` +
           `Analyses aujourd'hui: <b>${used}/${limit}</b>\n\n` +
-          `${premium && appUser.plan_expires_at ? `Expire: <b>${String(appUser.plan_expires_at).slice(0, 10)}</b>\n\n` : ''}` +
-          `Pour t'abonner: <code>/subscribe</code>`
+          `${premium && appUser.plan_expires_at ? `Expire: <b>${String(appUser.plan_expires_at).slice(0, 10)}</b>\n\n` : ""}` +
+          `Pour t'abonner: <code>/subscribe</code>`,
       );
-      return new Response('OK', { status: 200 });
+      return new Response("OK", { status: 200 });
     }
 
-    if (!adminMode && command === '/subscribe') {
+    if (!adminMode && command === "/subscribe") {
       await reply(
         chatId,
         `💳 <b>Abonnement Premium</b>\n\n` +
           `Prix: <b>500 FCFA / mois</b>\n` +
           `Avantages: flux illimités, plusieurs canaux/sources.\n\n` +
-          `⏳ Paiement Nelsius Pay: en cours d'intégration.`
+          `⏳ Paiement Nelsius Pay: en cours d'intégration.`,
       );
-      return new Response('OK', { status: 200 });
+      return new Response("OK", { status: 200 });
+    }
+
+    if (!adminMode && command === "/addsource") {
+      const channel = normalizeTelegramChannel(args[0] || "");
+      if (!channel) {
+        await reply(chatId, "⚠️ Usage: /addsource &lt;@canal ou URL t.me&gt;");
+      } else {
+        const { data: existing } = await supabase
+          .from("user_sources")
+          .select("id, is_active")
+          .eq("user_id", appUser.id)
+          .eq("type", "telegram")
+          .eq("config->>channel", channel)
+          .maybeSingle();
+
+        if (existing) {
+          if (!existing.is_active) {
+            await supabase
+              .from("user_sources")
+              .update({ is_active: true })
+              .eq("id", existing.id);
+          }
+          await reply(
+            chatId,
+            `ℹ️ Source déjà enregistrée: <code>${shortId(existing.id)}</code> — @${channel}`,
+          );
+        } else {
+          const { data: inserted, error } = await supabase
+            .from("user_sources")
+            .insert({
+              user_id: appUser.id,
+              type: "telegram",
+              config: { channel },
+              is_active: true,
+            })
+            .select("id")
+            .maybeSingle();
+          if (error) await reply(chatId, `❌ Erreur: ${error.message}`);
+          else
+            await reply(
+              chatId,
+              `✅ Source ajoutée\nID: <code>${shortId(inserted.id)}</code>\nCanal: <b>@${channel}</b>`,
+            );
+        }
+      }
+      return new Response("OK", { status: 200 });
+    }
+
+    if (!adminMode && command === "/sources") {
+      const { data: sources, error } = await supabase
+        .from("user_sources")
+        .select("id, type, config, is_active, created_at")
+        .eq("user_id", appUser.id)
+        .order("created_at", { ascending: false });
+      if (error) await reply(chatId, `❌ Erreur: ${error.message}`);
+      else if (!sources?.length)
+        await reply(
+          chatId,
+          "📭 Tu n'as aucune source. Ajoute-en une avec /addsource @canal",
+        );
+      else {
+        const lines = sources.map(
+          (s: any) =>
+            `${s.is_active ? "🟢" : "🔴"} <code>${shortId(s.id)}</code> — @${s.config?.channel || "?"}`,
+        );
+        await reply(chatId, `📡 <b>Mes sources</b>\n\n${lines.join("\n")}`);
+      }
+      return new Response("OK", { status: 200 });
+    }
+
+    if (!adminMode && command === "/delsource") {
+      const src = await findOwnedRecord(
+        supabase,
+        "user_sources",
+        appUser.id,
+        args[0],
+      );
+      if (!src) await reply(chatId, "❌ Source non trouvée.");
+      else {
+        await supabase
+          .from("user_sources")
+          .update({ is_active: false })
+          .eq("id", src.id);
+        await supabase
+          .from("flows")
+          .update({ is_active: false })
+          .eq("user_id", appUser.id)
+          .eq("source_id", src.id);
+        await reply(
+          chatId,
+          `✅ Source désactivée: <b>@${src.config?.channel || "?"}</b>`,
+        );
+      }
+      return new Response("OK", { status: 200 });
+    }
+
+    if (!adminMode && command === "/addtarget") {
+      const targetChat = normalizeTargetChat(args[0] || "");
+      const title = args.slice(1).join(" ").trim() || targetChat;
+      if (!targetChat) {
+        await reply(
+          chatId,
+          "⚠️ Usage: /addtarget &lt;@canal ou -100...&gt; [nom]",
+        );
+      } else {
+        let warning = "";
+        try {
+          const check = await fetch(`${BASE}/getChat`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ chat_id: targetChat }),
+          });
+          const checkData = await check.json();
+          if (!checkData.ok)
+            warning =
+              "\n\n⚠️ Je n'arrive pas encore à vérifier ce canal. Ajoute le bot comme admin du canal cible.";
+        } catch (_e) {
+          warning = "\n\n⚠️ Vérification du canal impossible pour le moment.";
+        }
+
+        const { data: existing } = await supabase
+          .from("user_targets")
+          .select("id, is_active")
+          .eq("user_id", appUser.id)
+          .eq("chat_id", targetChat)
+          .maybeSingle();
+        if (existing) {
+          if (!existing.is_active) {
+            await supabase
+              .from("user_targets")
+              .update({ is_active: true, title })
+              .eq("id", existing.id);
+          }
+          await reply(
+            chatId,
+            `ℹ️ Cible déjà enregistrée: <code>${shortId(existing.id)}</code> — ${targetChat}${warning}`,
+          );
+        } else {
+          const { data: inserted, error } = await supabase
+            .from("user_targets")
+            .insert({
+              user_id: appUser.id,
+              chat_id: targetChat,
+              title,
+              is_active: true,
+            })
+            .select("id")
+            .maybeSingle();
+          if (error) await reply(chatId, `❌ Erreur: ${error.message}`);
+          else
+            await reply(
+              chatId,
+              `✅ Canal cible ajouté\nID: <code>${shortId(inserted.id)}</code>\nCible: <b>${targetChat}</b>${warning}`,
+            );
+        }
+      }
+      return new Response("OK", { status: 200 });
+    }
+
+    if (!adminMode && command === "/targets") {
+      const { data: targets, error } = await supabase
+        .from("user_targets")
+        .select("id, chat_id, title, is_active, created_at")
+        .eq("user_id", appUser.id)
+        .order("created_at", { ascending: false });
+      if (error) await reply(chatId, `❌ Erreur: ${error.message}`);
+      else if (!targets?.length)
+        await reply(
+          chatId,
+          "📭 Tu n'as aucun canal cible. Ajoute-en un avec /addtarget @moncanal",
+        );
+      else {
+        const lines = targets.map(
+          (t: any) =>
+            `${t.is_active ? "🟢" : "🔴"} <code>${shortId(t.id)}</code> — <b>${t.title || t.chat_id}</b> (${t.chat_id})`,
+        );
+        await reply(
+          chatId,
+          `🎯 <b>Mes canaux cibles</b>\n\n${lines.join("\n")}`,
+        );
+      }
+      return new Response("OK", { status: 200 });
+    }
+
+    if (!adminMode && command === "/deltarget") {
+      const target = await findOwnedRecord(
+        supabase,
+        "user_targets",
+        appUser.id,
+        args[0],
+      );
+      if (!target) await reply(chatId, "❌ Canal cible non trouvé.");
+      else {
+        await supabase
+          .from("user_targets")
+          .update({ is_active: false })
+          .eq("id", target.id);
+        await supabase
+          .from("flows")
+          .update({ is_active: false })
+          .eq("user_id", appUser.id)
+          .eq("target_id", target.id);
+        await reply(
+          chatId,
+          `✅ Canal cible désactivé: <b>${target.title || target.chat_id}</b>`,
+        );
+      }
+      return new Response("OK", { status: 200 });
+    }
+
+    if (!adminMode && command === "/addflow") {
+      const premium = isPremium(appUser);
+      if (!premium) {
+        const { count } = await supabase
+          .from("flows")
+          .select("*", { count: "exact", head: true })
+          .eq("user_id", appUser.id)
+          .eq("is_active", true);
+        if ((count || 0) >= 1) {
+          await reply(
+            chatId,
+            "🔒 Le plan gratuit autorise 1 seul flux actif. Utilise /subscribe pour passer Premium ou désactive un flux.",
+          );
+          return new Response("OK", { status: 200 });
+        }
+      }
+
+      const src = await findOwnedRecord(
+        supabase,
+        "user_sources",
+        appUser.id,
+        args[0],
+      );
+      const target = await findOwnedRecord(
+        supabase,
+        "user_targets",
+        appUser.id,
+        args[1],
+      );
+      if (!src || !src.is_active)
+        await reply(
+          chatId,
+          "❌ Source introuvable ou inactive. Vérifie /sources.",
+        );
+      else if (!target || !target.is_active)
+        await reply(
+          chatId,
+          "❌ Cible introuvable ou inactive. Vérifie /targets.",
+        );
+      else {
+        const { data: inserted, error } = await supabase
+          .from("flows")
+          .insert({
+            user_id: appUser.id,
+            source_id: src.id,
+            target_id: target.id,
+            mode: "new_only",
+            initial_last_n: 5,
+            is_active: true,
+            filters: DEFAULT_FLOW_FILTERS,
+          })
+          .select("id")
+          .maybeSingle();
+        if (error) await reply(chatId, `❌ Erreur: ${error.message}`);
+        else
+          await reply(
+            chatId,
+            `✅ Flux créé\nID: <code>${shortId(inserted.id)}</code>\n@${src.config?.channel} → ${target.chat_id}\n\nConfigure les filtres avec /filters ${shortId(inserted.id)}`,
+          );
+      }
+      return new Response("OK", { status: 200 });
+    }
+
+    if (!adminMode && command === "/flows") {
+      const { data: flows, error } = await supabase
+        .from("flows")
+        .select(
+          "id, is_active, last_message_id, last_run_at, last_error, filters, source:user_sources(config), target:user_targets(chat_id,title)",
+        )
+        .eq("user_id", appUser.id)
+        .order("created_at", { ascending: false });
+      if (error) await reply(chatId, `❌ Erreur: ${error.message}`);
+      else if (!flows?.length)
+        await reply(
+          chatId,
+          "📭 Aucun flux. Crée-en un avec /addflow source_id target_id",
+        );
+      else {
+        const lines = flows.map(
+          (f: any) =>
+            `${f.is_active ? "🟢" : "⏸"} <code>${shortId(f.id)}</code> — @${f.source?.config?.channel || "?"} → ${f.target?.chat_id || "?"}\n   Dernier msg: <b>${f.last_message_id || 0}</b>${f.last_error ? `\n   ⚠️ ${String(f.last_error).substring(0, 80)}` : ""}`,
+        );
+        await reply(chatId, `🔁 <b>Mes flux</b>\n\n${lines.join("\n\n")}`);
+      }
+      return new Response("OK", { status: 200 });
+    }
+
+    if (
+      !adminMode &&
+      ["/pauseflow", "/resumeflow", "/deleteflow"].includes(command)
+    ) {
+      const flow = await findOwnedRecord(
+        supabase,
+        "flows",
+        appUser.id,
+        args[0],
+      );
+      if (!flow) await reply(chatId, "❌ Flux non trouvé.");
+      else {
+        const active = command === "/resumeflow";
+        await supabase
+          .from("flows")
+          .update({ is_active: active })
+          .eq("id", flow.id)
+          .eq("user_id", appUser.id);
+        await reply(
+          chatId,
+          command === "/resumeflow"
+            ? `▶️ Flux repris: <code>${shortId(flow.id)}</code>`
+            : `⏸ Flux désactivé: <code>${shortId(flow.id)}</code>`,
+        );
+      }
+      return new Response("OK", { status: 200 });
+    }
+
+    if (!adminMode && command === "/filters") {
+      const flow = await findOwnedRecord(
+        supabase,
+        "flows",
+        appUser.id,
+        args[0],
+      );
+      if (!flow) await reply(chatId, "❌ Flux non trouvé.");
+      else {
+        const filters = mergeFilters(flow.filters, {});
+        await reply(
+          chatId,
+          `🧰 <b>Filtres du flux ${shortId(flow.id)}</b>\n\n` +
+            `Mots obligatoires: <b>${filters.include_keywords.length ? filters.include_keywords.join(", ") : "aucun"}</b>\n` +
+            `Mots interdits: <b>${filters.exclude_keywords.length ? filters.exclude_keywords.join(", ") : "aucun"}</b>\n` +
+            `Bloquer pubs: <b>${filters.block_ads ? "oui" : "non"}</b>\n` +
+            `Média seulement: <b>${filters.media_only ? "oui" : "non"}</b>\n` +
+            `Albums: <b>${filters.allow_albums ? "oui" : "non"}</b>\n` +
+            `Reformulation IA: <b>${filters.use_ai_rewrite ? "oui" : "non"}</b>\n` +
+            `Signature: <b>${filters.signature_text || "aucune"}</b>`,
+        );
+      }
+      return new Response("OK", { status: 200 });
+    }
+
+    if (
+      !adminMode &&
+      [
+        "/include",
+        "/exclude",
+        "/blockads",
+        "/mediaonly",
+        "/allowalbums",
+        "/rewriteai",
+        "/signature",
+      ].includes(command)
+    ) {
+      const flow = await findOwnedRecord(
+        supabase,
+        "flows",
+        appUser.id,
+        args[0],
+      );
+      if (!flow) {
+        await reply(chatId, "❌ Flux non trouvé.");
+        return new Response("OK", { status: 200 });
+      }
+
+      let patch: Record<string, unknown> = {};
+      if (command === "/include")
+        patch = { include_keywords: parseKeywordList(args.slice(1).join(" ")) };
+      if (command === "/exclude")
+        patch = { exclude_keywords: parseKeywordList(args.slice(1).join(" ")) };
+      if (
+        ["/blockads", "/mediaonly", "/allowalbums", "/rewriteai"].includes(
+          command,
+        )
+      ) {
+        const value = parseOnOff(args[1]);
+        if (value === null) {
+          await reply(chatId, `⚠️ Usage: ${command} &lt;flow_id&gt; on|off`);
+          return new Response("OK", { status: 200 });
+        }
+        const key =
+          command === "/blockads"
+            ? "block_ads"
+            : command === "/mediaonly"
+              ? "media_only"
+              : command === "/allowalbums"
+                ? "allow_albums"
+                : "use_ai_rewrite";
+        patch = { [key]: value };
+      }
+      if (command === "/signature")
+        patch = {
+          signature_text: args.slice(1).join(" ").trim().substring(0, 200),
+        };
+
+      const filters = mergeFilters(flow.filters, patch);
+      const { error } = await supabase
+        .from("flows")
+        .update({ filters })
+        .eq("id", flow.id)
+        .eq("user_id", appUser.id);
+      if (error) await reply(chatId, `❌ Erreur: ${error.message}`);
+      else
+        await reply(
+          chatId,
+          `✅ Filtres mis à jour pour le flux <code>${shortId(flow.id)}</code>. Voir /filters ${shortId(flow.id)}`,
+        );
+      return new Response("OK", { status: 200 });
+    }
+
+    if (!adminMode && command === "/activity") {
+      const { data: rows, error } = await supabase
+        .from("flow_activity")
+        .select(
+          "id, status, reason, original_url, text_preview, media_count, created_at, flow_id",
+        )
+        .eq("user_id", appUser.id)
+        .order("created_at", { ascending: false })
+        .limit(10);
+      if (error) await reply(chatId, `❌ Erreur: ${error.message}`);
+      else if (!rows?.length)
+        await reply(chatId, "📭 Aucune activité pour le moment.");
+      else {
+        const lines = rows.map((r: any) => {
+          const date = new Date(r.created_at).toLocaleString("fr-FR");
+          return `${r.status === "published" ? "✅" : "⏭"} <code>${shortId(r.flow_id || r.id)}</code> — ${r.status}${r.reason ? ` (${r.reason})` : ""}\n   ${date} — médias: ${r.media_count}\n   ${(r.text_preview || r.original_url || "").substring(0, 90)}`;
+        });
+        await reply(
+          chatId,
+          `📊 <b>Dernières activités</b>\n\n${lines.join("\n\n")}`,
+        );
+      }
+      return new Response("OK", { status: 200 });
     }
 
     // ── Admin-only security gate ──────────────────────────────────────────
     if (!adminMode) {
-      await reply(chatId, '⛔ Accès refusé.');
-      return new Response('OK', { status: 200 });
+      await reply(chatId, `❓ Commande inconnue.\n\n${USER_HELP}`);
+      return new Response("OK", { status: 200 });
     }
 
     // ── /start | /help ────────────────────────────────────────────────────
-    if (command === '/start' || command === '/help' || !command) {
+    if (command === "/start" || command === "/help" || !command) {
       await reply(chatId, HELP);
     }
 
     // ── /stats ────────────────────────────────────────────────────────────
-    else if (command === '/stats') {
+    else if (command === "/stats") {
       const [{ count: total }, { count: today }] = await Promise.all([
-        supabase.from('articles').select('*', { count: 'exact', head: true }),
-        supabase.from('articles').select('*', { count: 'exact', head: true })
-          .gte('created_at', new Date(Date.now() - 86400000).toISOString()),
+        supabase.from("articles").select("*", { count: "exact", head: true }),
+        supabase
+          .from("articles")
+          .select("*", { count: "exact", head: true })
+          .gte("created_at", new Date(Date.now() - 86400000).toISOString()),
       ]);
-      const { count: srcCount } = await supabase.from('sources')
-        .select('*', { count: 'exact', head: true }).eq('is_active', true);
-      await reply(chatId,
+      const { count: srcCount } = await supabase
+        .from("sources")
+        .select("*", { count: "exact", head: true })
+        .eq("is_active", true);
+      await reply(
+        chatId,
         `📊 <b>Statistiques</b>\n\n` +
-        `📰 Articles total: <b>${total ?? 0}</b>\n` +
-        `🕐 Dernières 24h: <b>${today ?? 0}</b>\n` +
-        `📡 Sources actives: <b>${srcCount ?? 0}</b>`
+          `📰 Articles total: <b>${total ?? 0}</b>\n` +
+          `🕐 Dernières 24h: <b>${today ?? 0}</b>\n` +
+          `📡 Sources actives: <b>${srcCount ?? 0}</b>`,
       );
     }
 
     // ── /list ─────────────────────────────────────────────────────────────
-    else if (command === '/list') {
+    else if (command === "/list") {
       const limit = Math.min(parseInt(args[0]) || 10, 20);
       const { data: articles, error } = await supabase
-        .from('articles').select('id, title, created_at')
-        .order('created_at', { ascending: false }).limit(limit);
+        .from("articles")
+        .select("id, title, created_at")
+        .order("created_at", { ascending: false })
+        .limit(limit);
 
-      if (error) { await reply(chatId, `❌ Erreur: ${error.message}`); }
-      else if (!articles?.length) { await reply(chatId, '📭 Aucun article.'); }
-      else {
-        const lines = articles.map((a, i) => {
-          const date = new Date(a.created_at).toLocaleDateString('fr-FR');
+      if (error) {
+        await reply(chatId, `❌ Erreur: ${error.message}`);
+      } else if (!articles?.length) {
+        await reply(chatId, "📭 Aucun article.");
+      } else {
+        const lines = articles.map((a: any, i: number) => {
+          const date = new Date(a.created_at).toLocaleDateString("fr-FR");
           const shortId = a.id.substring(0, 8);
-          return `${i + 1}. <code>${shortId}</code> — ${(a.title || 'Sans titre').substring(0, 50)}\n   📅 ${date}`;
+          return `${i + 1}. <code>${shortId}</code> — ${(a.title || "Sans titre").substring(0, 50)}\n   📅 ${date}`;
         });
-        await reply(chatId, `📰 <b>Derniers ${articles.length} articles:</b>\n\n${lines.join('\n\n')}`);
+        await reply(
+          chatId,
+          `📰 <b>Derniers ${articles.length} articles:</b>\n\n${lines.join("\n\n")}`,
+        );
       }
     }
 
     // ── /article ──────────────────────────────────────────────────────────
-    else if (command === '/article') {
-      if (!args[0]) { await reply(chatId, '⚠️ Usage: /article &lt;id&gt;'); }
-      else {
-        const { data: a } = await supabase.from('articles').select('*')
-          .ilike('id', `${args[0]}%`).limit(1).maybeSingle();
-        if (!a) { await reply(chatId, '❌ Article non trouvé.'); }
-        else {
-          const msg = `📰 <b>${a.title}</b>\n\n${(a.content || a.summary || '').substring(0, 700)}\n\n` +
+    else if (command === "/article") {
+      if (!args[0]) {
+        await reply(chatId, "⚠️ Usage: /article &lt;id&gt;");
+      } else {
+        const { data: a } = await supabase
+          .from("articles")
+          .select("*")
+          .ilike("id", `${args[0]}%`)
+          .limit(1)
+          .maybeSingle();
+        if (!a) {
+          await reply(chatId, "❌ Article non trouvé.");
+        } else {
+          const msg =
+            `📰 <b>${a.title}</b>\n\n${(a.content || a.summary || "").substring(0, 700)}\n\n` +
             `🔗 <a href="${a.original_url}">Source originale</a>\n` +
             `🆔 <code>${a.id}</code>`;
           if (a.image_url) {
@@ -282,64 +881,101 @@ Deno.serve(async (req) => {
     }
 
     // ── /delete ───────────────────────────────────────────────────────────
-    else if (command === '/delete') {
-      if (!args[0]) { await reply(chatId, '⚠️ Usage: /delete &lt;id&gt;'); }
-      else {
-        const { data: a } = await supabase.from('articles').select('id, title')
-          .ilike('id', `${args[0]}%`).limit(1).maybeSingle();
-        if (!a) { await reply(chatId, '❌ Article non trouvé.'); }
-        else {
-          const { error } = await supabase.from('articles').delete().eq('id', a.id);
-          if (error) { await reply(chatId, `❌ Erreur: ${error.message}`); }
-          else { await reply(chatId, `✅ Article supprimé:\n<i>${a.title}</i>`); }
+    else if (command === "/delete") {
+      if (!args[0]) {
+        await reply(chatId, "⚠️ Usage: /delete &lt;id&gt;");
+      } else {
+        const { data: a } = await supabase
+          .from("articles")
+          .select("id, title")
+          .ilike("id", `${args[0]}%`)
+          .limit(1)
+          .maybeSingle();
+        if (!a) {
+          await reply(chatId, "❌ Article non trouvé.");
+        } else {
+          const { error } = await supabase
+            .from("articles")
+            .delete()
+            .eq("id", a.id);
+          if (error) {
+            await reply(chatId, `❌ Erreur: ${error.message}`);
+          } else {
+            await reply(chatId, `✅ Article supprimé:\n<i>${a.title}</i>`);
+          }
         }
       }
     }
 
     // ── /deleteall ────────────────────────────────────────────────────────
-    else if (command === '/deleteall') {
-      const { error } = await supabase.from('articles').delete().neq('id', '00000000-0000-0000-0000-000000000000');
-      if (error) { await reply(chatId, `❌ Erreur lors de la suppression: ${error.message}`); }
-      else { await reply(chatId, `✅ TOUS les articles ont été supprimés de la base de données.`); }
+    else if (command === "/deleteall") {
+      const { error } = await supabase
+        .from("articles")
+        .delete()
+        .neq("id", "00000000-0000-0000-0000-000000000000");
+      if (error) {
+        await reply(
+          chatId,
+          `❌ Erreur lors de la suppression: ${error.message}`,
+        );
+      } else {
+        await reply(
+          chatId,
+          `✅ TOUS les articles ont été supprimés de la base de données.`,
+        );
+      }
     }
 
     // ── /clearall ─────────────────────────────────────────────────────────
-    else if (command === '/clearall') {
-      const forceMode = args[0] === 'force';
-      await reply(chatId, forceMode 
-        ? '⏳ Nettoyage TOTAL (force) en cours... Cela peut prendre 2-3 minutes.' 
-        : '⏳ Suppression en cours des messages du canal et de la base...'
+    else if (command === "/clearall") {
+      const forceMode = args[0] === "force";
+      await reply(
+        chatId,
+        forceMode
+          ? "⏳ Nettoyage TOTAL (force) en cours... Cela peut prendre 2-3 minutes."
+          : "⏳ Suppression en cours des messages du canal et de la base...",
       );
-      
+
       try {
         let deletedCount = 0;
         let failedCount = 0;
 
         // 1. FORCE MODE: Try to delete last 100 messages by message_id range
         if (forceMode && OUTPUT_CHAT_ID) {
-          await reply(chatId, '🔥 Mode FORCE: tentative suppression des 100 derniers messages...');
-          
+          await reply(
+            chatId,
+            "🔥 Mode FORCE: tentative suppression des 100 derniers messages...",
+          );
+
           // Try to get the latest message first to know where to start
           let startMsgId = 1000; // Default high number
           try {
-            const latestRes = await fetch(`${BASE}/getUpdates?limit=1&offset=-1`);
+            const latestRes = await fetch(
+              `${BASE}/getUpdates?limit=1&offset=-1`,
+            );
             const latestData = await latestRes.json();
             if (latestData.ok && latestData.result?.length > 0) {
-              const lastUpdate = latestData.result[latestData.result.length - 1];
-              if (lastUpdate.channel_post?.chat?.id?.toString() === OUTPUT_CHAT_ID.replace('@', '')) {
+              const lastUpdate =
+                latestData.result[latestData.result.length - 1];
+              if (
+                lastUpdate.channel_post?.chat?.id?.toString() ===
+                OUTPUT_CHAT_ID.replace("@", "")
+              ) {
                 startMsgId = lastUpdate.channel_post.message_id;
               }
             }
           } catch (e) {
-            console.log('[Bot] Could not get latest update, using default range');
+            console.log(
+              "[Bot] Could not get latest update, using default range",
+            );
           }
 
           // Delete from startMsgId down to startMsgId-100
           const endMsgId = Math.max(1, startMsgId - 100);
           for (let msgId = startMsgId; msgId >= endMsgId; msgId--) {
             const delRes = await fetch(`${BASE}/deleteMessage`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
               body: JSON.stringify({
                 chat_id: OUTPUT_CHAT_ID,
                 message_id: msgId,
@@ -348,25 +984,30 @@ Deno.serve(async (req) => {
             const delData = await delRes.json();
             if (delData.ok) {
               deletedCount++;
-            } else if (!delData.description?.includes('message to delete not found')) {
+            } else if (
+              !delData.description?.includes("message to delete not found")
+            ) {
               // Only count real errors, not "message not found"
               failedCount++;
             }
             // Small delay to avoid rate limits
-            await new Promise(r => setTimeout(r, 50));
+            await new Promise((r) => setTimeout(r, 50));
           }
         }
 
         // 2. Get all articles with telegram_message_id (for tracked messages)
         const { data: articles, error: fetchError } = await supabase
-          .from('articles')
-          .select('id, telegram_message_id, telegram_chat_id, title')
-          .not('telegram_message_id', 'is', null)
-          .order('created_at', { ascending: false });
-        
+          .from("articles")
+          .select("id, telegram_message_id, telegram_chat_id, title")
+          .not("telegram_message_id", "is", null)
+          .order("created_at", { ascending: false });
+
         if (fetchError) {
-          await reply(chatId, `❌ Erreur récupération articles: ${fetchError.message}`);
-          return new Response('OK', { status: 200 });
+          await reply(
+            chatId,
+            `❌ Erreur récupération articles: ${fetchError.message}`,
+          );
+          return new Response("OK", { status: 200 });
         }
 
         // 3. Delete tracked messages from Telegram channel
@@ -374,8 +1015,8 @@ Deno.serve(async (req) => {
           for (const article of articles) {
             if (article.telegram_message_id && article.telegram_chat_id) {
               const delRes = await fetch(`${BASE}/deleteMessage`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
                   chat_id: article.telegram_chat_id,
                   message_id: article.telegram_message_id,
@@ -386,92 +1027,112 @@ Deno.serve(async (req) => {
                 deletedCount++;
               } else {
                 failedCount++;
-                console.warn(`[Bot] Failed to delete message ${article.telegram_message_id}:`, delData.description);
+                console.warn(
+                  `[Bot] Failed to delete message ${article.telegram_message_id}:`,
+                  delData.description,
+                );
               }
               // Small delay to avoid rate limits
-              await new Promise(r => setTimeout(r, 100));
+              await new Promise((r) => setTimeout(r, 100));
             }
           }
         }
 
         // 4. Delete all articles from DB
         const { error: deleteError } = await supabase
-          .from('articles')
+          .from("articles")
           .delete()
-          .neq('id', '00000000-0000-0000-0000-000000000000');
-        
+          .neq("id", "00000000-0000-0000-0000-000000000000");
+
         if (deleteError) {
-          await reply(chatId, `❌ Erreur suppression DB: ${deleteError.message}`);
-          return new Response('OK', { status: 200 });
+          await reply(
+            chatId,
+            `❌ Erreur suppression DB: ${deleteError.message}`,
+          );
+          return new Response("OK", { status: 200 });
         }
 
         // 5. Reset last_message_id in all telegram sources (first run mode)
         const { data: sources } = await supabase
-          .from('sources')
-          .select('id, config')
-          .eq('type', 'telegram');
-        
+          .from("sources")
+          .select("id, config")
+          .eq("type", "telegram");
+
         let resetCount = 0;
         if (sources) {
           for (const source of sources) {
-            const newConfig = { ...source.config, last_message_id: '0' };
+            const newConfig = { ...source.config, last_message_id: "0" };
             const { error: updateError } = await supabase
-              .from('sources')
+              .from("sources")
               .update({ config: newConfig })
-              .eq('id', source.id);
+              .eq("id", source.id);
             if (!updateError) resetCount++;
           }
         }
 
-        await reply(chatId, 
+        await reply(
+          chatId,
           `✅ <b>Nettoyage complet terminé</b>\n\n` +
-          `${forceMode ? '🔥 Mode FORCE utilisé\n' : ''}` +
-          `🗑 Messages Telegram supprimés: <b>${deletedCount}</b>\n` +
-          `❌ Échecs: <b>${failedCount}</b>\n` +
-          `🗑 Articles DB supprimés: <b>${articles?.length || 0}</b>\n` +
-          `🔄 Sources reset: <b>${resetCount}</b>\n\n` +
-          `💡 Astuce: Utilise <code>/clearall force</code> pour supprimer les 100 derniers messages du canal (même sans tracking).`
+            `${forceMode ? "🔥 Mode FORCE utilisé\n" : ""}` +
+            `🗑 Messages Telegram supprimés: <b>${deletedCount}</b>\n` +
+            `❌ Échecs: <b>${failedCount}</b>\n` +
+            `🗑 Articles DB supprimés: <b>${articles?.length || 0}</b>\n` +
+            `🔄 Sources reset: <b>${resetCount}</b>\n\n` +
+            `💡 Astuce: Utilise <code>/clearall force</code> pour supprimer les 100 derniers messages du canal (même sans tracking).`,
         );
       } catch (err) {
-        console.error('[Bot] /clearall error:', err);
-        await reply(chatId, `💥 Erreur lors du nettoyage: ${(err as Error).message}`);
+        console.error("[Bot] /clearall error:", err);
+        await reply(
+          chatId,
+          `💥 Erreur lors du nettoyage: ${(err as Error).message}`,
+        );
       }
     }
 
     // ── /publish ──────────────────────────────────────────────────────────
-    else if (command === '/publish') {
-      let content = args.join(' ').trim();
-      if (!content && !hasMedia) { await reply(chatId, '⚠️ Usage: /publish <texte>\nOu envoie un média avec /publish en légende.'); }
-      else {
-        let finalTitle = 'Publication admin';
+    else if (command === "/publish") {
+      let content = args.join(" ").trim();
+      if (!content && !hasMedia) {
+        await reply(
+          chatId,
+          "⚠️ Usage: /publish <texte>\nOu envoie un média avec /publish en légende.",
+        );
+      } else {
+        let finalTitle = "Publication admin";
         let finalContent = content;
         let isAd = false;
 
         if (content) {
-          const geminiKey = Deno.env.get('GEMINI_API_KEY');
+          const geminiKey = Deno.env.get("GEMINI_API_KEY");
           if (geminiKey) {
-            await reply(chatId, '⏳ Structuration avec l\'IA...');
+            await reply(chatId, "⏳ Structuration avec l'IA...");
             const aiRes = await restructureWithAI(content, geminiKey);
             isAd = aiRes.isAd;
             if (aiRes.title) finalTitle = aiRes.title;
             if (aiRes.content) finalContent = aiRes.content;
           }
         }
-        
+
         if (isAd) {
-          await reply(chatId, '❌ Ce contenu a été détecté comme une publicité/spam et n\'a pas été publié.');
-          return new Response('OK', { status: 200 });
+          await reply(
+            chatId,
+            "❌ Ce contenu a été détecté comme une publicité/spam et n'a pas été publié.",
+          );
+          return new Response("OK", { status: 200 });
         }
 
-        const uniqueSuffix = new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 14);
+        const uniqueSuffix = new Date()
+          .toISOString()
+          .replace(/[-:.TZ]/g, "")
+          .slice(0, 14);
         const uniqueTitle = `${finalTitle} #${uniqueSuffix}`;
 
         // Automatically append @izynews at the very bottom
         const footer = "\n\n@izynews";
-        if (finalContent && !finalContent.includes('@izynews')) {
-            finalContent = `${finalContent.trim()}${footer}`;
+        if (finalContent && !finalContent.includes("@izynews")) {
+          finalContent = `${finalContent.trim()}${footer}`;
         } else if (!finalContent && hasMedia) {
-            finalContent = footer.trim();
+          finalContent = footer.trim();
         }
 
         const imageUrl = photo ? photo[photo.length - 1]?.file_id : null;
@@ -485,32 +1146,47 @@ Deno.serve(async (req) => {
         }
 
         // Insert into database
-        const { data: inserted, error } = await supabase.from('articles').insert({
-          title: uniqueTitle,
-          summary: finalContent.substring(0, 500),
-          content: finalContent,
-          original_url: `https://t.me/admin_publish_${Date.now()}`,
-          image_url: imagePublicUrl,
-          is_certified: true,
-        }).select('id').maybeSingle();
+        const { data: inserted, error } = await supabase
+          .from("articles")
+          .insert({
+            title: uniqueTitle,
+            summary: finalContent.substring(0, 500),
+            content: finalContent,
+            original_url: `https://t.me/admin_publish_${Date.now()}`,
+            image_url: imagePublicUrl,
+            is_certified: true,
+          })
+          .select("id")
+          .maybeSingle();
 
-        if (error) { 
-            console.error('[Bot] DB Insert Error:', error);
-            await reply(chatId, `❌ Erreur DB: ${error.message}`); 
-        }
-        else {
-          await reply(chatId, `✅ Article publié!\n🆔 <code>${inserted?.id?.substring(0, 8)}</code>`);
+        if (error) {
+          console.error("[Bot] DB Insert Error:", error);
+          await reply(chatId, `❌ Erreur DB: ${error.message}`);
+        } else {
+          await reply(
+            chatId,
+            `✅ Article publié!\n🆔 <code>${inserted?.id?.substring(0, 8)}</code>`,
+          );
 
           // Also forward to output channel
           if (OUTPUT_CHAT_ID) {
             if (hasMedia) {
               // Use copyMessage with new caption
-              await copyMessageToChat(OUTPUT_CHAT_ID, chatId, messageId, finalContent);
+              await copyMessageToChat(
+                OUTPUT_CHAT_ID,
+                chatId,
+                messageId,
+                finalContent,
+              );
             } else {
               await fetch(`${BASE}/sendMessage`, {
-                method: 'POST', 
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ chat_id: OUTPUT_CHAT_ID, text: finalContent.substring(0, 4096), parse_mode: 'HTML' }),
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  chat_id: OUTPUT_CHAT_ID,
+                  text: finalContent.substring(0, 4096),
+                  parse_mode: "HTML",
+                }),
               });
             }
           }
@@ -519,65 +1195,85 @@ Deno.serve(async (req) => {
     }
 
     // ── /sources ──────────────────────────────────────────────────────────
-    else if (command === '/sources') {
-      const { data: sources } = await supabase.from('sources').select('id, name, type, config, is_active')
-        .order('created_at', { ascending: false });
-      if (!sources?.length) { await reply(chatId, '📭 Aucune source.'); }
-      else {
-        const lines = sources.map(s => {
-          const icon = s.is_active ? '🟢' : '🔴';
-          const channel = s.config?.channel || '';
-          return `${icon} <code>${s.id.substring(0, 8)}</code> — <b>${s.name}</b> [${s.type}${channel ? ': @' + channel : ''}]`;
+    else if (command === "/sources") {
+      const { data: sources } = await supabase
+        .from("sources")
+        .select("id, name, type, config, is_active")
+        .order("created_at", { ascending: false });
+      if (!sources?.length) {
+        await reply(chatId, "📭 Aucune source.");
+      } else {
+        const lines = sources.map((s: any) => {
+          const icon = s.is_active ? "🟢" : "🔴";
+          const channel = s.config?.channel || "";
+          return `${icon} <code>${s.id.substring(0, 8)}</code> — <b>${s.name}</b> [${s.type}${channel ? ": @" + channel : ""}]`;
         });
-        await reply(chatId, `📡 <b>Sources (${sources.length}):</b>\n\n${lines.join('\n')}`);
+        await reply(
+          chatId,
+          `📡 <b>Sources (${sources.length}):</b>\n\n${lines.join("\n")}`,
+        );
       }
     }
 
     // ── /addsource ────────────────────────────────────────────────────────
-    else if (command === '/addsource') {
+    else if (command === "/addsource") {
       let channel = args[0]?.trim();
-      if (!channel) { await reply(chatId, '⚠️ Usage: /addsource <@canal ou URL_TME>'); }
-      else {
-        if (channel.includes('t.me/')) {
-          const parts = channel.split('t.me/');
-          channel = parts[parts.length - 1].split('/')[0].split('?')[0];
+      if (!channel) {
+        await reply(chatId, "⚠️ Usage: /addsource <@canal ou URL_TME>");
+      } else {
+        if (channel.includes("t.me/")) {
+          const parts = channel.split("t.me/");
+          channel = parts[parts.length - 1].split("/")[0].split("?")[0];
         }
-        channel = channel.replace(/^@/, '').toLowerCase();
+        channel = channel.replace(/^@/, "").toLowerCase();
 
-        const { error } = await supabase.from('sources').insert({
+        const { error } = await supabase.from("sources").insert({
           name: `@${channel}`,
-          type: 'telegram',
+          type: "telegram",
           config: { channel },
           is_active: true,
         });
-        if (error) { await reply(chatId, `❌ Erreur: ${error.message}`); }
-        else { 
-            await reply(chatId, `✅ Source ajoutée avec succès!\n📡 Canal: <b>@${channel}</b>\n\nL'agrégation automatique récupérera les prochaines nouvelles.`); 
+        if (error) {
+          await reply(chatId, `❌ Erreur: ${error.message}`);
+        } else {
+          await reply(
+            chatId,
+            `✅ Source ajoutée avec succès!\n📡 Canal: <b>@${channel}</b>\n\nL'agrégation automatique récupérera les prochaines nouvelles.`,
+          );
         }
       }
     }
 
     // ── /delsource ────────────────────────────────────────────────────────
-    else if (command === '/delsource') {
-      if (!args[0]) { await reply(chatId, '⚠️ Usage: /delsource &lt;id&gt;'); }
-      else {
-        const { data: src } = await supabase.from('sources').select('id, name')
-          .ilike('id', `${args[0]}%`).limit(1).maybeSingle();
-        if (!src) { await reply(chatId, '❌ Source non trouvée.'); }
-        else {
-          await supabase.from('sources').update({ is_active: false }).eq('id', src.id);
+    else if (command === "/delsource") {
+      if (!args[0]) {
+        await reply(chatId, "⚠️ Usage: /delsource &lt;id&gt;");
+      } else {
+        const { data: src } = await supabase
+          .from("sources")
+          .select("id, name")
+          .ilike("id", `${args[0]}%`)
+          .limit(1)
+          .maybeSingle();
+        if (!src) {
+          await reply(chatId, "❌ Source non trouvée.");
+        } else {
+          await supabase
+            .from("sources")
+            .update({ is_active: false })
+            .eq("id", src.id);
           await reply(chatId, `✅ Source désactivée: <b>${src.name}</b>`);
         }
       }
     }
 
     // ── /run ──────────────────────────────────────────────────────────────
-    else if (command === '/run') {
-      await reply(chatId, '⏳ Agrégation en cours...');
-      const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? '';
-      const serviceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '';
+    else if (command === "/run") {
+      await reply(chatId, "⏳ Agrégation en cours...");
+      const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "";
+      const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
       const res = await fetch(`${supabaseUrl}/functions/v1/aggregate_news`, {
-        method: 'POST',
+        method: "POST",
         headers: { Authorization: `Bearer ${serviceKey}` },
       });
       const raw = await res.text();
@@ -589,35 +1285,54 @@ Deno.serve(async (req) => {
       }
 
       if (!res.ok) {
-        console.error('[Bot] /run aggregate_news HTTP error:', res.status, raw?.slice(0, 500));
-        await reply(chatId, `❌ Erreur d'agrégation (HTTP ${res.status}). Vérifie les logs Supabase.`);
-        return new Response('OK', { status: 200 });
+        console.error(
+          "[Bot] /run aggregate_news HTTP error:",
+          res.status,
+          raw?.slice(0, 500),
+        );
+        await reply(
+          chatId,
+          `❌ Erreur d'agrégation (HTTP ${res.status}). Vérifie les logs Supabase.`,
+        );
+        return new Response("OK", { status: 200 });
       }
 
       if (!result) {
-        console.error('[Bot] /run aggregate_news invalid JSON:', raw?.slice(0, 500));
-        await reply(chatId, `❌ Erreur d'agrégation: réponse invalide (non-JSON). Vérifie les logs Supabase.`);
-        return new Response('OK', { status: 200 });
+        console.error(
+          "[Bot] /run aggregate_news invalid JSON:",
+          raw?.slice(0, 500),
+        );
+        await reply(
+          chatId,
+          `❌ Erreur d'agrégation: réponse invalide (non-JSON). Vérifie les logs Supabase.`,
+        );
+        return new Response("OK", { status: 200 });
       }
 
       if (result.success) {
-        await reply(chatId,
-          `✅ Agrégation terminée!\n📊 Traités: <b>${result.processed}</b>\n🆕 Nouveaux: <b>${result.new}</b>`
+        await reply(
+          chatId,
+          `✅ Agrégation terminée!\n📊 Traités: <b>${result.processed}</b>\n🆕 Nouveaux: <b>${result.new}</b>`,
         );
       } else {
-        await reply(chatId, `❌ Erreur d'agrégation: ${result.error || 'inconnue'}`);
+        await reply(
+          chatId,
+          `❌ Erreur d'agrégation: ${result.error || "inconnue"}`,
+        );
       }
     }
 
     // ── Unknown command ───────────────────────────────────────────────────
     else {
-      await reply(chatId, `❓ Commande inconnue. Tape /help pour voir les commandes disponibles.`);
+      await reply(
+        chatId,
+        `❓ Commande inconnue. Tape /help pour voir les commandes disponibles.`,
+      );
     }
-
   } catch (err) {
-    console.error('[Bot] Error:', err);
+    console.error("[Bot] Error:", err);
     await reply(chatId, `💥 Erreur serveur: ${(err as Error).message}`);
   }
 
-  return new Response('OK', { status: 200 });
+  return new Response("OK", { status: 200 });
 });
