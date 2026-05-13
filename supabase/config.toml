@@ -434,3 +434,8 @@ enabled = true
 verify_jwt = false
 import_map = "./functions/telegram_bot/deno.json"
 entrypoint = "./functions/telegram_bot/index.ts"
+
+[functions.nelsius_webhook]
+enabled = true
+verify_jwt = false
+entrypoint = "./functions/nelsius_webhook/index.ts"

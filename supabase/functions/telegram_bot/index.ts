@@ -74,7 +74,8 @@ function userMenuMarkup() {
         ["⏸ Désactiver flux", "▶️ Réactiver flux"],
         ["📡 Mes sources", "🎯 Mes cibles"],
         ["📊 Activité", "👤 Mon compte"],
-        ["💳 Premium", "❓ Aide"],
+        ["💳 Premium", "💰 Dépôt"],
+        ["❓ Aide"],
       ],
       resize_keyboard: true,
       one_time_keyboard: false,
@@ -135,6 +136,7 @@ function commandFromButton(label: string): string | null {
     "📊 Activité": "/activity",
     "👤 Mon compte": "/me",
     "💳 Premium": "/subscribe",
+    "💰 Dépôt": "/deposit",
     "❓ Aide": "/help",
     "▶️ Lancer agrégation": "/run",
     "📊 Stats": "/stats",
@@ -402,6 +404,95 @@ async function checkBotAdminInChat(
     };
   } catch (e) {
     return { ok: false, reason: (e as Error).message };
+  }
+}
+
+async function createNelsiusCheckout(
+  supabase: any,
+  appUser: any,
+  paymentType: "subscription" | "deposit",
+  amount: number,
+) {
+  const secretKey = Deno.env.get("NELSIUS_SECRET_KEY") || "";
+  if (!secretKey)
+    return {
+      checkoutUrl: null,
+      error: "Clé Nelsius manquante: configure NELSIUS_SECRET_KEY.",
+    };
+
+  const bot = await getBotInfo();
+  const reference = `${paymentType.toUpperCase()}_${appUser.telegram_user_id}_${Date.now()}`;
+  const returnUrl =
+    Deno.env.get("NELSIUS_RETURN_URL") ||
+    (bot ? `https://t.me/${bot.username}` : "https://t.me/");
+
+  const { data: payment, error: insertError } = await supabase
+    .from("payments")
+    .insert({
+      user_id: appUser.id,
+      provider: "nelsius",
+      reference,
+      amount,
+      currency: "XAF",
+      status: "created",
+      payment_type: paymentType,
+      metadata: { telegram_user_id: appUser.telegram_user_id },
+    })
+    .select("id")
+    .maybeSingle();
+  if (insertError) return { checkoutUrl: null, error: insertError.message };
+
+  try {
+    const res = await fetch(
+      `${Deno.env.get("NELSIUS_BASE_URL") || "https://api.nelsius.com"}/api/v1/checkout/sessions`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${secretKey}`,
+          Accept: "application/json",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          amount,
+          currency: "XAF",
+          reference,
+          return_url: returnUrl,
+          customer: {
+            name: appUser.username || `Telegram ${appUser.telegram_user_id}`,
+          },
+        }),
+      },
+    );
+    const data = await res.json();
+    const checkoutUrl = data?.data?.checkout_url || data?.checkout_url || null;
+    const externalId =
+      data?.data?.id || data?.id || data?.data?.session_id || null;
+
+    await supabase
+      .from("payments")
+      .update({
+        status: data?.success === false ? "failed" : "pending",
+        checkout_url: checkoutUrl,
+        external_id: externalId,
+        raw_payload: data,
+      })
+      .eq("id", payment.id);
+
+    if (!checkoutUrl)
+      return {
+        checkoutUrl: null,
+        error: data?.message || "Nelsius n'a pas retourné de lien de paiement.",
+      };
+    return { checkoutUrl, error: null };
+  } catch (e) {
+    await supabase
+      .from("payments")
+      .update({
+        status: "failed",
+        raw_payload: { error: (e as Error).message },
+      })
+      .eq("id", payment.id);
+    return { checkoutUrl: null, error: (e as Error).message };
   }
 }
 
@@ -831,6 +922,55 @@ Deno.serve(async (req: Request) => {
       const state = appUser.bot_state || {};
       const draft = state.draft || {};
 
+      if (state.step === "deposit_amount") {
+        const amount = Number(text.replace(/\s+/g, ""));
+        if (!amount || amount < 100) {
+          await reply(
+            chatId,
+            "❌ Montant invalide. Envoie un montant en FCFA supérieur ou égal à 100, ou clique sur Annuler.",
+          );
+          return new Response("OK", { status: 200 });
+        }
+        await clearBotState(supabase, appUser.id);
+        await reply(chatId, "⏳ Création du lien de dépôt...");
+        const result = await createNelsiusCheckout(
+          supabase,
+          appUser,
+          "deposit",
+          amount,
+        );
+        if (result.error || !result.checkoutUrl) {
+          await reply(
+            chatId,
+            `❌ Dépôt indisponible: ${result.error}`,
+            userMenuMarkup(),
+          );
+        } else {
+          await reply(
+            chatId,
+            `💰 <b>Dépôt wallet</b>\n\nMontant: <b>${amount} FCFA</b>\n\nClique sur le bouton ci-dessous pour payer avec Nelsius Pay.`,
+            {
+              reply_markup: {
+                inline_keyboard: [
+                  [
+                    {
+                      text: `💰 Déposer ${amount} FCFA`,
+                      url: result.checkoutUrl,
+                    },
+                  ],
+                ],
+              },
+            },
+          );
+          await reply(
+            chatId,
+            "Après paiement, reviens ici et tape /me pour vérifier ton solde.",
+            userMenuMarkup(),
+          );
+        }
+        return new Response("OK", { status: 200 });
+      }
+
       if (["choose_flow_pause", "choose_flow_resume"].includes(state.step)) {
         const idMatch = text.match(/[0-9a-f]{8}/i);
         const flow = idMatch
@@ -1026,23 +1166,107 @@ Deno.serve(async (req: Request) => {
         chatId,
         `👤 <b>Mon compte</b>\n\n` +
           `Plan: <b>${premium ? "Premium" : "Gratuit"}</b>\n` +
-          `Analyses aujourd'hui: <b>${used}/${limit}</b>\n\n` +
+          `Analyses aujourd'hui: <b>${used}/${limit}</b>\n` +
+          `Solde wallet: <b>${appUser.wallet_balance || 0} XAF</b>\n\n` +
           `${premium && appUser.plan_expires_at ? `Expire: <b>${String(appUser.plan_expires_at).slice(0, 10)}</b>\n\n` : ""}` +
-          `Pour t'abonner: <code>/subscribe</code>`,
+          `Pour t'abonner: <code>/subscribe</code>\nPour déposer: <code>/deposit montant</code>`,
         userMenuMarkup(),
       );
       return new Response("OK", { status: 200 });
     }
 
     if (!adminMode && command === "/subscribe") {
-      await reply(
-        chatId,
-        `💳 <b>Abonnement Premium</b>\n\n` +
-          `Prix: <b>500 FCFA / mois</b>\n` +
-          `Avantages: flux illimités, plusieurs canaux/sources.\n\n` +
-          `⏳ Paiement Nelsius Pay: en cours d'intégration.`,
-        userMenuMarkup(),
+      await reply(chatId, "⏳ Création du lien de paiement Premium...");
+      const result = await createNelsiusCheckout(
+        supabase,
+        appUser,
+        "subscription",
+        500,
       );
+      if (result.error || !result.checkoutUrl) {
+        await reply(
+          chatId,
+          `❌ Paiement indisponible: ${result.error}`,
+          userMenuMarkup(),
+        );
+      } else {
+        await reply(
+          chatId,
+          `💳 <b>Abonnement Premium</b>\n\nPrix: <b>500 FCFA / mois</b>\n\nClique sur le bouton ci-dessous pour payer avec Nelsius Pay. Ton compte deviendra Premium automatiquement après confirmation du paiement.`,
+          {
+            reply_markup: {
+              inline_keyboard: [
+                [{ text: "💳 Payer 500 FCFA", url: result.checkoutUrl }],
+              ],
+            },
+          },
+        );
+        await reply(
+          chatId,
+          "Après paiement, reviens ici et tape /me pour vérifier ton statut.",
+          userMenuMarkup(),
+        );
+      }
+      return new Response("OK", { status: 200 });
+    }
+
+    if (!adminMode && command === "/deposit") {
+      const amount = Number(args[0] || 0);
+      if (!amount || amount < 100) {
+        await setBotState(supabase, appUser.id, {
+          step: "deposit_amount",
+          draft: {},
+        });
+        await reply(
+          chatId,
+          "💰 <b>Dépôt</b>\n\nEntre le montant à déposer en FCFA.\nMinimum: <b>100 FCFA</b>\n\nExemple: <code>1000</code>",
+          {
+            reply_markup: {
+              keyboard: [["❌ Annuler"]],
+              resize_keyboard: true,
+              one_time_keyboard: true,
+            },
+          },
+        );
+        return new Response("OK", { status: 200 });
+      }
+
+      await reply(chatId, "⏳ Création du lien de dépôt...");
+      const result = await createNelsiusCheckout(
+        supabase,
+        appUser,
+        "deposit",
+        amount,
+      );
+      if (result.error || !result.checkoutUrl) {
+        await reply(
+          chatId,
+          `❌ Dépôt indisponible: ${result.error}`,
+          userMenuMarkup(),
+        );
+      } else {
+        await reply(
+          chatId,
+          `💰 <b>Dépôt wallet</b>\n\nMontant: <b>${amount} FCFA</b>\n\nClique sur le bouton ci-dessous pour payer avec Nelsius Pay. Ton solde sera crédité automatiquement après confirmation.`,
+          {
+            reply_markup: {
+              inline_keyboard: [
+                [
+                  {
+                    text: `💰 Déposer ${amount} FCFA`,
+                    url: result.checkoutUrl,
+                  },
+                ],
+              ],
+            },
+          },
+        );
+        await reply(
+          chatId,
+          "Après paiement, reviens ici et tape /me pour vérifier ton solde.",
+          userMenuMarkup(),
+        );
+      }
       return new Response("OK", { status: 200 });
     }
 
