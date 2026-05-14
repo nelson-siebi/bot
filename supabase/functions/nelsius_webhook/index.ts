@@ -24,6 +24,48 @@ function extractPayloadValue(payload: any, keys: string[]): string | null {
   return null;
 }
 
+/**
+ * Recursively scan the payload for any value that looks like a reference.
+ * This catches unknown Nelsius payload formats.
+ */
+function findAnyReferenceLike(payload: any, depth = 0): string | null {
+  if (depth > 5 || payload == null) return null;
+
+  // Direct string values that look like references
+  if (typeof payload === "string") {
+    const trimmed = payload.trim();
+    if (
+      trimmed.length > 8 &&
+      (trimmed.startsWith("DEPOSIT_") ||
+        trimmed.startsWith("SUBSCRIPTION_") ||
+        trimmed.startsWith("PREMIUM_") ||
+        trimmed.startsWith("PRO_PLUS_") ||
+        trimmed.startsWith("WALLET_") ||
+        /^[A-Z_]+_\d+_\d+$/.test(trimmed))
+    ) {
+      return trimmed;
+    }
+    return null;
+  }
+
+  // Arrays: scan each element
+  if (Array.isArray(payload)) {
+    for (const item of payload) {
+      const found = findAnyReferenceLike(item, depth + 1);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  // Objects: check all values
+  for (const val of Object.values(payload)) {
+    const found = findAnyReferenceLike(val, depth + 1);
+    if (found) return found;
+  }
+
+  return null;
+}
+
 Deno.serve(async (req: Request) => {
   if (req.method !== "POST") {
     return new Response("Nelsius webhook OK", { status: 200 });
@@ -67,6 +109,14 @@ Deno.serve(async (req: Request) => {
     "payment.reference_id",
     "transaction.reference",
     "transaction.reference_id",
+    "data.id",
+    "id",
+    "session_id",
+    "data.session_id",
+    "charge_id",
+    "data.charge_id",
+    "transaction_code",
+    "data.transaction_code",
   ]);
   const status =
     extractPayloadValue(payload, [
@@ -74,6 +124,8 @@ Deno.serve(async (req: Request) => {
       "data.status",
       "payment.status",
       "transaction.status",
+      "event",
+      "data.event",
     ]) || "unknown";
   const externalId = extractPayloadValue(payload, [
     "id",
@@ -85,31 +137,43 @@ Deno.serve(async (req: Request) => {
     "data.charge_id",
     "data.session_id",
     "data.operator_transaction_id",
+    "reference_id",
+    "data.reference_id",
   ]);
 
-  if (!reference) {
-    return new Response(
-      JSON.stringify({ success: false, error: "Missing reference" }),
-      { status: 400 },
-    );
-  }
+  // Log incoming payload for debugging
+  console.log(
+    "[Nelsius Webhook] Payload received:",
+    JSON.stringify(payload).slice(0, 2000),
+  );
 
-  let { data: payment, error: paymentError } = await supabase
-    .from("payments")
-    .select("*")
-    .eq("reference", reference)
-    .maybeSingle();
+  // ── Strategy 1: Find payment by reference ────────────────────────────
+  let payment: any = null;
+  let paymentError: any = null;
 
-  if (!payment && reference) {
-    const fallback = await supabase
+  if (reference) {
+    // Try matching by reference field
+    const result = await supabase
       .from("payments")
       .select("*")
-      .eq("external_id", reference)
+      .eq("reference", reference)
       .maybeSingle();
-    payment = fallback.data;
-    paymentError = fallback.error;
+    payment = result.data;
+    paymentError = result.error;
+
+    if (!payment) {
+      // Try matching by external_id (in case Nelsius returned our ref as external_id)
+      const fallback = await supabase
+        .from("payments")
+        .select("*")
+        .eq("external_id", reference)
+        .maybeSingle();
+      payment = fallback.data;
+      paymentError = fallback.error;
+    }
   }
 
+  // ── Strategy 2: Find payment by external_id ──────────────────────────
   if (!payment && externalId) {
     const fallback = await supabase
       .from("payments")
@@ -118,6 +182,43 @@ Deno.serve(async (req: Request) => {
       .maybeSingle();
     payment = fallback.data;
     paymentError = fallback.error;
+
+    if (!payment) {
+      // Also try by reference in case external_id is our reference
+      const fallback2 = await supabase
+        .from("payments")
+        .select("*")
+        .eq("reference", externalId)
+        .maybeSingle();
+      if (fallback2.data) {
+        payment = fallback2.data;
+        paymentError = fallback2.error;
+      }
+    }
+  }
+
+  // ── Strategy 3: Recursive scan for reference-like strings in payload ─
+  if (!payment) {
+    const foundRef = findAnyReferenceLike(payload);
+    if (foundRef) {
+      console.log(
+        "[Nelsius Webhook] Found reference-like string in payload:",
+        foundRef,
+      );
+      const result = await supabase
+        .from("payments")
+        .select("*")
+        .eq("reference", foundRef)
+        .maybeSingle();
+      if (result.data) {
+        payment = result.data;
+        paymentError = result.error;
+        console.log(
+          "[Nelsius Webhook] Found payment by recursive scan:",
+          foundRef,
+        );
+      }
+    }
   }
 
   if (paymentError) {
@@ -128,6 +229,12 @@ Deno.serve(async (req: Request) => {
   }
 
   if (!payment) {
+    console.log(
+      "[Nelsius Webhook] Payment not found. reference:",
+      reference,
+      "externalId:",
+      externalId,
+    );
     return new Response(
       JSON.stringify({ success: false, error: "Payment not found" }),
       { status: 404 },
