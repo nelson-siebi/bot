@@ -280,16 +280,37 @@ async function fetchChannelPage(
   const url = beforeId
     ? `https://t.me/s/${channel}?before=${beforeId}`
     : `https://t.me/s/${channel}`;
-  const res = await fetch(url, {
-    headers: { "User-Agent": "Mozilla/5.0 (compatible; Googlebot/2.1)" },
-  });
-  if (!res.ok) {
-    console.error(
-      `[Scrape] HTTP ${res.status} for ${channel}${beforeId ? ` before=${beforeId}` : ""}`,
+
+  // Abort after 8 seconds to prevent hanging
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 8000);
+
+  try {
+    const res = await fetch(url, {
+      signal: controller.signal,
+      headers: { "User-Agent": "Mozilla/5.0 (compatible; Googlebot/2.1)" },
+    });
+    clearTimeout(timeoutId);
+    if (!res.ok) {
+      console.error(
+        `[Scrape] HTTP ${res.status} for ${channel}${beforeId ? ` before=${beforeId}` : ""}`,
+      );
+      return "";
+    }
+    const text = await res.text();
+    console.log(
+      `[Scrape] Fetched page for @${channel}${beforeId ? ` before=${beforeId}` : ""}, size: ${(text.length / 1024).toFixed(1)}KB`,
     );
+    return text;
+  } catch (e: any) {
+    clearTimeout(timeoutId);
+    if (e.name === "AbortError") {
+      console.error(`[Scrape] Timeout fetching @${channel} after 8s`);
+    } else {
+      console.error(`[Scrape] Fetch error for @${channel}:`, e.message || e);
+    }
     return "";
   }
-  return await res.text();
 }
 
 async function scrapeChannel(
