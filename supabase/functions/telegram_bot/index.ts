@@ -1343,7 +1343,10 @@ Deno.serve(async (req: Request) => {
           `• Traduction automatique\n` +
           `• Filtres avancés par flux\n` +
           `• Remplacement mots/liens et suppression pubs\n\n` +
-          `👉 Clique sur <b>➕ Nouveau flux</b> pour commencer.`,
+          `👉 Clique sur <b>➕ Nouveau flux</b> pour commencer.
+
+` +
+          `📞 <b>Support</b> : @nelsonsiebie`,
         userMenuMarkup(),
       );
       return new Response("OK", { status: 200 });
