@@ -6,7 +6,7 @@ const BOT_TOKEN = Deno.env.get("TELEGRAM_BOT_TOKEN") || "";
 const OUTPUT_CHAT_ID = Deno.env.get("TELEGRAM_CHAT_ID") || "";
 const GEMINI_API_KEY = Deno.env.get("GEMINI_API_KEY") || "";
 const FREE_USER_SIGNATURE =
-  Deno.env.get("FREE_USER_SIGNATURE") || "🤖 Propulsé par IzyNews";
+  Deno.env.get("FREE_USER_SIGNATURE") || "🤖 Propulsé par @izynews_bot";
 
 // Storj S3-compatible configuration
 const STORJ_ACCESS_KEY = Deno.env.get("STORJ_ACCESS_KEY") || "";
