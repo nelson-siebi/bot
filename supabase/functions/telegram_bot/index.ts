@@ -494,6 +494,8 @@ async function createNelsiusCheckout(
     const externalId =
       data?.data?.reference_id ||
       data?.reference_id ||
+      data?.data?.reference ||
+      data?.reference ||
       data?.data?.transaction_code ||
       data?.transaction_code ||
       data?.data?.id ||

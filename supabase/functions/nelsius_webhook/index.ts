@@ -100,6 +100,12 @@ Deno.serve(async (req: Request) => {
     );
   }
 
+  // Extract all possible identifiers from the webhook payload
+  // session_id is the most reliable (same in create response AND webhook)
+  const sessionId = extractPayloadValue(payload, [
+    "session_id",
+    "data.session_id",
+  ]);
   const reference = extractPayloadValue(payload, [
     "reference",
     "reference_id",
@@ -117,6 +123,8 @@ Deno.serve(async (req: Request) => {
     "data.charge_id",
     "transaction_code",
     "data.transaction_code",
+    "operator_transaction_id",
+    "data.operator_transaction_id",
   ]);
   const status =
     extractPayloadValue(payload, [
@@ -137,9 +145,47 @@ Deno.serve(async (req: Request) => {
     "data.charge_id",
     "data.session_id",
     "data.operator_transaction_id",
+    "operator_transaction_id",
     "reference_id",
     "data.reference_id",
   ]);
+  const payerPhone = extractPayloadValue(payload, [
+    "payer_phone",
+    "data.payer_phone",
+    "phone",
+    "data.phone",
+    "customer.phone",
+    "data.customer.phone",
+  ]);
+  const payerEmail = extractPayloadValue(payload, [
+    "payer_email",
+    "data.payer_email",
+    "email",
+    "data.email",
+    "customer.email",
+    "data.customer.email",
+  ]);
+  const webhookAmount = parseFloat(
+    extractPayloadValue(payload, [
+      "amount",
+      "data.amount",
+      "payment.amount",
+      "transaction.amount",
+    ]) || "0",
+  );
+
+  console.log(
+    "[Nelsius Webhook] reference:",
+    reference,
+    "externalId:",
+    externalId,
+    "sessionId:",
+    sessionId,
+    "payerPhone:",
+    payerPhone,
+    "amount:",
+    webhookAmount,
+  );
 
   // Log incoming payload for debugging
   console.log(
@@ -147,11 +193,27 @@ Deno.serve(async (req: Request) => {
     JSON.stringify(payload).slice(0, 2000),
   );
 
-  // ── Strategy 1: Find payment by reference ────────────────────────────
+  // ── Strategy 0: Find payment by session_id (most reliable) ──────────
   let payment: any = null;
   let paymentError: any = null;
 
-  if (reference) {
+  if (sessionId) {
+    // Check by external_id (where we stored session_id at creation)
+    const result = await supabase
+      .from("payments")
+      .select("*")
+      .eq("external_id", sessionId)
+      .maybeSingle();
+    payment = result.data;
+    paymentError = result.error;
+
+    if (payment) {
+      console.log("[Nelsius Webhook] Found payment by session_id:", sessionId);
+    }
+  }
+
+  // ── Strategy 1: Find payment by reference ────────────────────────────
+  if (!payment && reference) {
     // Try matching by reference field
     const result = await supabase
       .from("payments")
@@ -217,6 +279,58 @@ Deno.serve(async (req: Request) => {
           "[Nelsius Webhook] Found payment by recursive scan:",
           foundRef,
         );
+      }
+    }
+  }
+
+  // ── Strategy 4: Search pending payments by raw_payload (the create checkout response) ─
+  if (!payment) {
+    // Check if any pending/created payment has our reference or external_id
+    // stored somewhere in its raw_payload JSONB
+    const { data: pendingPayments } = await supabase
+      .from("payments")
+      .select(
+        "id, reference, external_id, amount, user_id, raw_payload, created_at",
+      )
+      .in("status", ["created", "pending"])
+      .order("created_at", { ascending: false })
+      .limit(20);
+
+    if (pendingPayments && pendingPayments.length > 0) {
+      console.log(
+        "[Nelsius Webhook] Checking",
+        pendingPayments.length,
+        "pending payments...",
+      );
+
+      const searchValues = [reference, externalId].filter(
+        (v): v is string => v !== null && v !== undefined,
+      );
+
+      for (const pp of pendingPayments) {
+        // Check by amount match (if amount is close enough)
+        const dbAmount = Math.round(Number(pp.amount) || 0);
+        const whAmount = Math.round(webhookAmount);
+        const amountMatch = whAmount > 0 && Math.abs(dbAmount - whAmount) <= 1;
+
+        // Check if any search value appears in the raw_payload JSON
+        let payloadMatch = false;
+        if (searchValues.length > 0 && pp.raw_payload) {
+          const rawStr = JSON.stringify(pp.raw_payload);
+          payloadMatch = searchValues.some((v) => rawStr.includes(v));
+        }
+
+        if (amountMatch && payloadMatch) {
+          payment = pp;
+          paymentError = null;
+          console.log(
+            "[Nelsius Webhook] Found payment by raw_payload+amount:",
+            pp.id,
+            "ref:",
+            pp.reference,
+          );
+          break;
+        }
       }
     }
   }
